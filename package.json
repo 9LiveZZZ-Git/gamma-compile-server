@@ -1,0 +1,33 @@
+{
+  "name": "@9livezzz/gamma-compile-server",
+  "version": "0.1.0",
+  "description": "Local Emscripten-based compile daemon for the Gamma Node Editor's real-time audio preview. Runs on localhost:8765.",
+  "type": "module",
+  "main": "src/server.js",
+  "bin": {
+    "gamma-compile-server": "bin/gamma-compile-server.js"
+  },
+  "scripts": {
+    "start": "node bin/gamma-compile-server.js",
+    "test": "node tests/smoke.js"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "cors": "^2.8.5"
+  },
+  "files": [
+    "bin/",
+    "src/",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": ["gamma", "emscripten", "wasm", "audio", "dsp", "compile-server"],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/9LiveZZZ-Git/gamma-compile-server"
+  }
+}
