@@ -1,12 +1,26 @@
 // HTTP server that exposes a single /compile endpoint plus /health.
-// Designed to be hit ONLY from the editor running on
-// 9livezzz-git.github.io. CORS opens for that origin.
+// Default deployment binds to loopback and accepts requests from the
+// GitHub Pages editor + a handful of localhost dev origins. The CLI
+// can extend either dimension (--host 0.0.0.0, --allowOrigin <url>) to
+// support LAN setups (e.g. patch on an iPad against a Mac daemon).
 
 import express from "express";
 import cors from "cors";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
 import { compile } from "./compile.js";
 
-const ALLOWED_ORIGINS = [
+// Read package version once at startup so /health reports the actual
+// running version. Better than hardcoding a string that drifts on bumps.
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const PKG_VERSION = (() => {
+  try {
+    return JSON.parse(readFileSync(join(__dirname, "..", "package.json"), "utf8")).version || "0.0.0";
+  } catch (_) { return "0.0.0"; }
+})();
+
+const DEFAULT_ALLOWED_ORIGINS = [
   "https://9livezzz-git.github.io",
   "http://localhost:8080",   // for local dev of the editor
   "http://localhost:5173",
@@ -16,7 +30,17 @@ const ALLOWED_ORIGINS = [
   "http://127.0.0.1:3000",
 ];
 
-export async function startServer({ port, toolchain, cacheDir }) {
+export async function startServer({ port, host, extraOrigins, toolchain, cacheDir }) {
+  const bindHost = host || "127.0.0.1";
+  // Normalize extra origins (strip trailing slash, drop blanks).
+  const cleanedExtras = (extraOrigins || [])
+    .map(o => String(o).trim().replace(/\/+$/, ""))
+    .filter(Boolean);
+  const allowAny = cleanedExtras.includes("*");
+  const allowedOrigins = new Set([
+    ...DEFAULT_ALLOWED_ORIGINS,
+    ...cleanedExtras.filter(o => o !== "*")
+  ]);
   const app = express();
 
   // Chrome's Private Network Access policy (Chrome 130+) blocks
@@ -36,8 +60,10 @@ export async function startServer({ port, toolchain, cacheDir }) {
     origin: (origin, cb) => {
       // No origin = curl / direct hit. Allow.
       if (!origin) return cb(null, true);
-      if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
-      // Anything else is rejected. Add to ALLOWED_ORIGINS if you self-host.
+      if (allowAny) return cb(null, true);
+      if (allowedOrigins.has(origin)) return cb(null, true);
+      // Anything else is rejected. Use --allowOrigin <url> on the CLI
+      // (or `*` for any origin) when self-hosting the editor.
       cb(new Error("CORS: origin not allowed: " + origin));
     },
     methods: ["GET", "POST", "OPTIONS"],
@@ -52,7 +78,7 @@ export async function startServer({ port, toolchain, cacheDir }) {
     res.json({
       ok: true,
       service: "gamma-compile-server",
-      version: "0.1.0",
+      version: PKG_VERSION,
       toolchain: { emsdkDir: toolchain.emsdkDir, gammaDir: toolchain.gammaDir }
     });
   });
@@ -85,20 +111,33 @@ export async function startServer({ port, toolchain, cacheDir }) {
     }
   });
 
-  app.listen(port, "127.0.0.1", () => {
+  app.listen(port, bindHost, () => {
+    const isLanBound = bindHost === "0.0.0.0" || bindHost === "::";
+    const displayHost = isLanBound ? "<LAN>" : bindHost;
+    const fmtLine = (s) => "│ " + s.padEnd(60) + " │";
     console.log("");
-    console.log("┌──────────────────────────────────────────────────────────────┐");
-    console.log("│ gamma-compile-server listening on http://127.0.0.1:" + String(port).padEnd(8) + " │");
-    console.log("│                                                              │");
-    console.log("│ Open the editor:                                             │");
-    console.log("│   https://9livezzz-git.github.io/Gamma-Node/                 │");
-    console.log("│                                                              │");
-    console.log("│ Click ▶. The editor auto-detects this daemon and routes     │");
-    console.log("│ compile requests here. Compile time should drop to seconds.  │");
-    console.log("│                                                              │");
-    console.log("│ Cache: " + cacheDir.padEnd(54) + "│");
-    console.log("│                                                              │");
-    console.log("│ Stop with Ctrl-C.                                            │");
-    console.log("└──────────────────────────────────────────────────────────────┘");
+    console.log("┌" + "─".repeat(62) + "┐");
+    console.log(fmtLine("gamma-compile-server listening on http://" + displayHost + ":" + port));
+    console.log(fmtLine(""));
+    if (isLanBound) {
+      console.log(fmtLine("⚠ Bound to all interfaces — reachable from your LAN."));
+      console.log(fmtLine("  Only do this on a trusted network."));
+      console.log(fmtLine(""));
+    }
+    console.log(fmtLine("Open the editor:"));
+    console.log(fmtLine("  https://9livezzz-git.github.io/Gamma-Node/"));
+    console.log(fmtLine(""));
+    console.log(fmtLine("Click ▶. The editor auto-detects this daemon and"));
+    console.log(fmtLine("routes compile requests here."));
+    console.log(fmtLine(""));
+    if (cleanedExtras.length) {
+      console.log(fmtLine("Extra allowed origins:"));
+      for (const o of cleanedExtras) console.log(fmtLine("  " + o));
+      console.log(fmtLine(""));
+    }
+    console.log(fmtLine("Cache: " + cacheDir.slice(0, 52)));
+    console.log(fmtLine(""));
+    console.log(fmtLine("Stop with Ctrl-C."));
+    console.log("└" + "─".repeat(62) + "┘");
   });
 }

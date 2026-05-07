@@ -1,7 +1,7 @@
 {
   "name": "@9livezzz/gamma-compile-server",
-  "version": "0.1.0",
-  "description": "Local Emscripten-based compile daemon for the Gamma Node Editor's real-time audio preview. Runs on localhost:8765.",
+  "version": "0.2.0",
+  "description": "Local Emscripten-based compile daemon for the Gamma Node Editor's real-time audio preview. Runs on localhost:8765 by default; --host/--allowOrigin let it serve a LAN setup (e.g. iPad → Mac).",
   "type": "module",
   "main": "src/server.js",
   "bin": {

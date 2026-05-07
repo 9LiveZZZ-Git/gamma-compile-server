@@ -21,19 +21,63 @@ Then open the editor at https://9livezzz-git.github.io/Gamma-Node/ and click ▶
 ## CLI flags
 
 ```
-gamma-compile-server [--port 8765] [--cacheDir <path>]
+gamma-compile-server [--port 8765] [--host 127.0.0.1]
+                     [--allowOrigin <url>]... [--cacheDir <path>]
                      [--skipSetup] [--setupOnly]
 
-  --port       HTTP port (default 8765).
-  --cacheDir   Where to keep emsdk + Gamma. Defaults are:
-                 Windows  %LOCALAPPDATA%\gamma-compile
-                 macOS    ~/Library/Caches/gamma-compile
-                 Linux    ~/.cache/gamma-compile
-  --skipSetup  Skip toolchain check (point at pre-installed emsdk
-               via GAMMA_COMPILE_EMSDK env var).
-  --setupOnly  Download + install the toolchain and exit, without
-               starting the server. Useful for installer scripts.
+  --port         HTTP port (default 8765).
+  --host         Network interface to bind to (default 127.0.0.1, i.e.
+                 loopback only). Use 0.0.0.0 to accept connections from
+                 other devices on your LAN — see "LAN setup" below.
+                 ⚠ Only do this on a trusted network: /compile compiles
+                 whatever C++ you send it.
+  --allowOrigin  Extra CORS origin (repeatable). Default whitelist is
+                 the GitHub Pages editor + localhost dev ports. Pass
+                 the URL you're serving the editor from when self-
+                 hosting (e.g. http://192.168.1.42:8000), or "*" to
+                 allow any origin.
+  --cacheDir     Where to keep emsdk + Gamma. Defaults are:
+                   Windows  %LOCALAPPDATA%\gamma-compile
+                   macOS    ~/Library/Caches/gamma-compile
+                   Linux    ~/.cache/gamma-compile
+  --skipSetup    Skip toolchain check (point at pre-installed emsdk
+                 via GAMMA_COMPILE_EMSDK env var).
+  --setupOnly    Download + install the toolchain and exit, without
+                 starting the server. Useful for installer scripts.
 ```
+
+## LAN setup (e.g. patch on iPad → daemon on Mac)
+
+The daemon binds to loopback by default — fine when the editor and the
+daemon run on the same machine. To use the daemon from a phone or
+tablet on the same network:
+
+1. **On the host machine** (the one with the toolchain — typically a
+   Mac or PC), bind the daemon to all interfaces and whitelist the URL
+   you'll serve the editor from:
+
+   ```bash
+   gamma-compile-server --host 0.0.0.0 \
+       --allowOrigin http://192.168.1.42:8000
+   ```
+
+2. **Serve the editor over plain HTTP** from the same host. The GitHub
+   Pages copy is served over HTTPS, and browsers block fetches from
+   HTTPS pages to non-localhost HTTP URLs (mixed content). Easiest
+   workaround: clone the editor repo and run
+
+   ```bash
+   cd Gamma-Node
+   python -m http.server 8000
+   ```
+
+3. **On the client device** (iPad, phone, second laptop), open
+   `http://192.168.1.42:8000/gamma-node-editor.html`. Open ⚙ Settings,
+   set **Compile server URL** to `http://192.168.1.42:8765`, hit
+   **Test connection**, then **Save**.
+
+Replace `192.168.1.42` with your host's actual LAN IP. The daemon's
+startup banner shows when it's bound to all interfaces.
 
 ## How the editor finds it
 
