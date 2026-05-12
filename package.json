@@ -1,7 +1,7 @@
 {
   "name": "@9livezzz/gamma-compile-server",
-  "version": "0.2.0",
-  "description": "Local Emscripten-based compile daemon for the Gamma Node Editor's real-time audio preview. Runs on localhost:8765 by default; --host/--allowOrigin let it serve a LAN setup (e.g. iPad → Mac).",
+  "version": "0.3.0",
+  "description": "Local Emscripten compile daemon + OSC bridge for the Gamma Node Editor. Runs on localhost:8765 by default and listens for OSC on udp://localhost:9000; --host/--allowOrigin let it serve a LAN setup (e.g. iPad → Mac).",
   "type": "module",
   "main": "src/server.js",
   "bin": {
@@ -15,8 +15,9 @@
     "node": ">=20.0.0"
   },
   "dependencies": {
+    "cors": "^2.8.5",
     "express": "^4.19.2",
-    "cors": "^2.8.5"
+    "ws": "^8.20.1"
   },
   "files": [
     "bin/",
@@ -24,7 +25,14 @@
     "README.md",
     "LICENSE"
   ],
-  "keywords": ["gamma", "emscripten", "wasm", "audio", "dsp", "compile-server"],
+  "keywords": [
+    "gamma",
+    "emscripten",
+    "wasm",
+    "audio",
+    "dsp",
+    "compile-server"
+  ],
   "license": "MIT",
   "repository": {
     "type": "git",

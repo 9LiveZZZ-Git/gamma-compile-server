@@ -17,6 +17,13 @@ const { values: opts } = parseArgs({
     cacheDir:    { type: "string",  default: "" },         // default resolved per-OS
     skipSetup:   { type: "boolean", default: false },      // assume toolchain present
     setupOnly:   { type: "boolean", default: false },      // download & exit
+    // OSC bridge flags. Bridge is ON by default; --noOsc disables it
+    // for setups that don't want a UDP port bound (e.g. shared dev
+    // boxes where port 9000 is taken).
+    noOsc:       { type: "boolean", default: false },
+    oscInPort:   { type: "string",  default: "9000" },     // udp listen port
+    oscOutHost:  { type: "string",  default: "127.0.0.1" },// default udp send target host
+    oscOutPort:  { type: "string",  default: "9001" },     // default udp send target port
     help:        { type: "boolean", short: "h", default: false },
     version:     { type: "boolean", short: "v", default: false }
   },
@@ -52,6 +59,20 @@ Usage: gamma-compile-server [--port 8765] [--host 127.0.0.1]
                  via GAMMA_COMPILE_EMSDK env var).
   --setupOnly    Download + verify the toolchain and exit, without
                  starting the server. Useful for installer scripts.
+  --noOsc        Disable the OSC bridge (UDP listener + WebSocket
+                 fan-out). The bridge lets external OSC apps
+                 (TouchOSC / Reaper / Max / Pure Data / hardware
+                 controllers) drive editor parameters via the OscIn
+                 node, and lets the editor send OSC out via OscOut.
+                 On by default; disable if UDP port 9000 is taken or
+                 you don't need OSC routing.
+  --oscInPort    UDP port to listen on for inbound OSC (default 9000).
+                 Point your OSC clients at this port.
+  --oscOutHost   Default destination host for outbound OSC (default
+                 127.0.0.1). Editor's OscOut node can override per
+                 message.
+  --oscOutPort   Default destination port for outbound OSC (default
+                 9001). Editor's OscOut node can override per message.
   --help         Show this message.
   --version      Print version and exit.
 
@@ -116,12 +137,31 @@ if (opts.setupOnly) {
   process.exit(0);
 }
 
+// Validate OSC port flags. Allow 0 only when --noOsc is set (sentinel
+// that means "no UDP at all"); otherwise require a real port number.
+const oscInPort  = parseInt(opts.oscInPort,  10);
+const oscOutPort = parseInt(opts.oscOutPort, 10);
+if (!opts.noOsc) {
+  if (!Number.isFinite(oscInPort)  || oscInPort  < 1 || oscInPort  > 65535) {
+    console.error("✗ Invalid --oscInPort:",  opts.oscInPort);
+    process.exit(1);
+  }
+  if (!Number.isFinite(oscOutPort) || oscOutPort < 1 || oscOutPort > 65535) {
+    console.error("✗ Invalid --oscOutPort:", opts.oscOutPort);
+    process.exit(1);
+  }
+}
+
 await startServer({
   port,
   host: opts.host,
   extraOrigins: opts.allowOrigin || [],
   toolchain,
-  cacheDir
+  cacheDir,
+  osc:         !opts.noOsc,
+  oscInPort,
+  oscOutHost:  opts.oscOutHost,
+  oscOutPort
 });
 
 function defaultCacheDir() {

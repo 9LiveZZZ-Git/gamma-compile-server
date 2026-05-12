@@ -10,6 +10,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { compile } from "./compile.js";
+import { startOscBridge } from "./osc-bridge.js";
 
 // Read package version once at startup so /health reports the actual
 // running version. Better than hardcoding a string that drifts on bumps.
@@ -30,7 +31,11 @@ const DEFAULT_ALLOWED_ORIGINS = [
   "http://127.0.0.1:3000",
 ];
 
-export async function startServer({ port, host, extraOrigins, toolchain, cacheDir }) {
+export async function startServer({
+  port, host, extraOrigins, toolchain, cacheDir,
+  // OSC bridge options (all optional; bridge is on by default).
+  osc = true, oscInPort = 9000, oscOutHost = "127.0.0.1", oscOutPort = 9001
+}) {
   const bindHost = host || "127.0.0.1";
   // Normalize extra origins (strip trailing slash, drop blanks).
   const cleanedExtras = (extraOrigins || [])
@@ -79,7 +84,15 @@ export async function startServer({ port, host, extraOrigins, toolchain, cacheDi
       ok: true,
       service: "gamma-compile-server",
       version: PKG_VERSION,
-      toolchain: { emsdkDir: toolchain.emsdkDir, gammaDir: toolchain.gammaDir }
+      toolchain: { emsdkDir: toolchain.emsdkDir, gammaDir: toolchain.gammaDir },
+      // OSC capability surface so the editor can probe whether the
+      // running daemon has the bridge enabled before attempting to
+      // open the WebSocket. Editor uses this to decide whether to
+      // light up the OSC connection UI.
+      osc: osc
+        ? { enabled: true, wsPath: "/osc", inPort: oscInPort,
+            defaultOut: { host: oscOutHost, port: oscOutPort } }
+        : { enabled: false }
     });
   });
 
@@ -111,7 +124,7 @@ export async function startServer({ port, host, extraOrigins, toolchain, cacheDi
     }
   });
 
-  app.listen(port, bindHost, () => {
+  const httpServer = app.listen(port, bindHost, async () => {
     const isLanBound = bindHost === "0.0.0.0" || bindHost === "::";
     const displayHost = isLanBound ? "<LAN>" : bindHost;
     const fmtLine = (s) => "│ " + s.padEnd(60) + " │";
@@ -130,6 +143,39 @@ export async function startServer({ port, host, extraOrigins, toolchain, cacheDi
     console.log(fmtLine("Click ▶. The editor auto-detects this daemon and"));
     console.log(fmtLine("routes compile requests here."));
     console.log(fmtLine(""));
+
+    // OSC bridge — UDP listener + WebSocket fan-out. Same host as the
+    // HTTP server; WS upgrade attaches to the already-listening
+    // httpServer so /osc lives on the same port as /compile. The UDP
+    // port is separate so external apps (TouchOSC, Reaper, Max) can
+    // target it directly with their conventional OSC client.
+    if (osc) {
+      try {
+        await startOscBridge({
+          httpServer,
+          oscInPort,
+          oscOutHost,
+          oscOutPort,
+          bindHost,
+          allowedOrigins,
+          allowAnyOrigin: allowAny
+        });
+        console.log(fmtLine("OSC bridge:"));
+        console.log(fmtLine("  inbound:  udp://" + (isLanBound ? "<LAN>" : bindHost) + ":" + oscInPort));
+        console.log(fmtLine("  outbound: udp://" + oscOutHost + ":" + oscOutPort + " (default)"));
+        console.log(fmtLine("  ws:       ws://" + displayHost + ":" + port + "/osc"));
+        console.log(fmtLine(""));
+      } catch (e) {
+        console.log(fmtLine("⚠ OSC bridge failed to start:"));
+        console.log(fmtLine("  " + (e && e.message || String(e))));
+        console.log(fmtLine("  (compile path still works; use --noOsc to silence)"));
+        console.log(fmtLine(""));
+      }
+    } else {
+      console.log(fmtLine("OSC bridge: disabled (--noOsc)"));
+      console.log(fmtLine(""));
+    }
+
     if (cleanedExtras.length) {
       console.log(fmtLine("Extra allowed origins:"));
       for (const o of cleanedExtras) console.log(fmtLine("  " + o));
@@ -140,4 +186,6 @@ export async function startServer({ port, host, extraOrigins, toolchain, cacheDi
     console.log(fmtLine("Stop with Ctrl-C."));
     console.log("└" + "─".repeat(62) + "┘");
   });
+
+  return httpServer;
 }
