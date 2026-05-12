@@ -192,28 +192,151 @@ export function encodeOsc(address, args) {
   return Buffer.concat([encodeString(address), encodeString(tags), ...argBufs]);
 }
 
-/* Test whether an OSC address pattern matches a target address.
+/* Encode an OSC bundle. `messages` is an array of {address, args}
+ * objects (or nested bundles, recursively). `timetag` is optional:
+ *   undefined / "immediate" -> the special immediate-now timetag
+ *     (63 zero bits + 1 in the LSB; receivers process the bundle
+ *      as soon as it arrives)
+ *   {sec, frac}             -> raw NTP timetag (sec since 1900,
+ *                              fractional seconds in 32 bits)
  *
- * Currently implements a SIMPLIFIED subset of the OSC pattern spec:
- *   *      matches any character sequence (within a single path part)
- *   ?      matches one character
- *   /      treated as a literal separator
+ * Bundle wire format (OSC 1.0 §3):
+ *   "#bundle\0"      8 bytes (string + null + 3 pad)
+ *   <timetag>        8 bytes (NTP)
+ *   for each element:
+ *     <int32 size>   4 bytes (size of this element in bytes)
+ *     <element>      message OR nested bundle
+ */
+export function encodeBundle(messages, timetag) {
+  if (!Array.isArray(messages)) {
+    throw new Error("osc: bundle messages must be an array");
+  }
+  const headerStr = encodeString("#bundle");
+  let ttHi = 0, ttLo = 1;        // immediate
+  if (timetag && typeof timetag === "object") {
+    ttHi = (timetag.sec  | 0) >>> 0;
+    ttLo = (timetag.frac | 0) >>> 0;
+  }
+  const tt = Buffer.alloc(8);
+  tt.writeUInt32BE(ttHi, 0);
+  tt.writeUInt32BE(ttLo, 4);
+
+  const elementBufs = [];
+  for (const m of messages) {
+    let el;
+    if (m && m.bundle && Array.isArray(m.messages)) {
+      el = encodeBundle(m.messages, m.timetag);
+    } else if (m && typeof m.address === "string") {
+      el = encodeOsc(m.address, m.args || []);
+    } else {
+      throw new Error("osc: bundle element must be {address, args} or nested bundle");
+    }
+    const sz = Buffer.alloc(4);
+    sz.writeInt32BE(el.length, 0);
+    elementBufs.push(sz, el);
+  }
+
+  return Buffer.concat([headerStr, tt, ...elementBufs]);
+}
+
+/* Compile an OSC address pattern to a regex. Implements the full
+ * OSC 1.0 wildcard set:
  *
- * Future: [a-z] character classes, {alt,erna,tives} braces, full
- * cross-segment wildcards. The MVP covers >95% of TouchOSC / Reaper
- * layouts which use literal addresses. */
-export function matchesPattern(pattern, address) {
-  if (pattern === address) return true;
-  // Compile pattern to regex. Each '*' → '[^/]*'; each '?' → '[^/]';
-  // anything else is literal-escaped.
+ *   ?           single character (NOT '/')
+ *   *           zero or more characters (NOT '/')
+ *   [abc]       character class -- matches one of a/b/c
+ *   [a-z]       character range
+ *   [!abc]      negated class (also accepts [^abc] for regex-style)
+ *   {alt,erna,tives}   alternation -- matches any of the listed strings
+ *   /           literal separator -- never matched by wildcards
+ *
+ * Returns a RegExp anchored to the full address. Cached internally so
+ * repeated calls with the same pattern are cheap. */
+const _patternRegexCache = new Map();
+const _PATTERN_CACHE_LIMIT = 512;
+
+export function patternToRegex(pattern) {
+  const cached = _patternRegexCache.get(pattern);
+  if (cached) return cached;
+
   let re = "^";
-  for (let i = 0; i < pattern.length; i++) {
+  let i = 0;
+  while (i < pattern.length) {
     const c = pattern[i];
-    if (c === "*") re += "[^/]*";
-    else if (c === "?") re += "[^/]";
-    else if ("/^$.|+()[]{}\\".includes(c)) re += "\\" + c;
-    else re += c;
+    if (c === "*") {
+      re += "[^/]*";
+      i++;
+    } else if (c === "?") {
+      re += "[^/]";
+      i++;
+    } else if (c === "[") {
+      // Character class. Find the matching ']' (no nesting allowed
+      // by the spec). Inside, '!' as the first character flips to
+      // negation; '-' between characters defines a range as per
+      // typical glob syntax.
+      const end = pattern.indexOf("]", i + 1);
+      if (end < 0) {
+        // Unmatched '[' -- treat as literal. Permissive over strict.
+        re += "\\[";
+        i++;
+      } else {
+        let body = pattern.slice(i + 1, end);
+        if (body.length === 0) {
+          // Empty class -- match nothing. Tolerate by writing an
+          // intentionally-impossible class.
+          re += "[^\\s\\S]";
+        } else {
+          if (body[0] === "!") body = "^" + body.slice(1);
+          // Regex character classes treat ']' literally only as the
+          // first char (after optional ^). Forward slashes are
+          // forbidden in OSC pattern classes, but we don't enforce.
+          // Escape backslash + closing bracket; everything else is
+          // OK inside a character class.
+          re += "[" + body.replace(/\\/g, "\\\\") + "]";
+        }
+        i = end + 1;
+      }
+    } else if (c === "{") {
+      // Alternation -- {abc,def,ghi}. Match any literal alternative.
+      // The OSC spec disallows '/' inside alternatives + nesting.
+      const end = pattern.indexOf("}", i + 1);
+      if (end < 0) {
+        re += "\\{";
+        i++;
+      } else {
+        const body = pattern.slice(i + 1, end);
+        const alts = body.split(",").map(s => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+        re += "(?:" + alts.join("|") + ")";
+        i = end + 1;
+      }
+    } else if ("/^$.|+()\\".includes(c)) {
+      // Regex metachars that aren't OSC wildcards -- literal-escape.
+      // '/' is explicitly listed so it can't collide with regex
+      // tokens; the OSC matcher treats it as a literal.
+      re += "\\" + c;
+      i++;
+    } else {
+      re += c;
+      i++;
+    }
   }
   re += "$";
-  return new RegExp(re).test(address);
+
+  let compiled;
+  try { compiled = new RegExp(re); }
+  catch (_) { compiled = /^.\B/; /* never matches anything */ }
+
+  // Bounded LRU-ish cache. On overflow drop the oldest entry to bound memory.
+  if (_patternRegexCache.size >= _PATTERN_CACHE_LIMIT) {
+    const firstKey = _patternRegexCache.keys().next().value;
+    _patternRegexCache.delete(firstKey);
+  }
+  _patternRegexCache.set(pattern, compiled);
+  return compiled;
+}
+
+/* Test whether an OSC address pattern matches a target address. */
+export function matchesPattern(pattern, address) {
+  if (pattern === address) return true;
+  return patternToRegex(pattern).test(address);
 }

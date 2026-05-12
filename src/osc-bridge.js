@@ -34,9 +34,9 @@
 
 import { createSocket } from "node:dgram";
 import { WebSocketServer } from "ws";
-import { decodeOsc, encodeOsc } from "./osc-codec.js";
+import { decodeOsc, encodeOsc, encodeBundle } from "./osc-codec.js";
 
-const PKG_VERSION = "0.3.0";
+const PKG_VERSION = "0.3.1";
 
 /* Start the OSC bridge attached to an existing HTTP server (so the
  * WebSocket upgrade lives on the same port as /compile and /health).
@@ -175,6 +175,34 @@ export function startOscBridge({
         catch (e) { return wsError(ws, "send-encode", e.message); }
         udp.send(packet, port, host, (err) => {
           if (err) wsError(ws, "send-udp", err.message);
+        });
+      } else if (msg.type === "send-bundle") {
+        // Outbound OSC bundle -- multiple messages packed into a
+        // single UDP datagram with an "immediate" timetag (the
+        // editor's _tickOscOut uses this when it has >1 OscOut
+        // value-change in a single frame, so the receiving app sees
+        // them as atomic).
+        if (!Array.isArray(msg.messages) || msg.messages.length === 0) {
+          return wsError(ws, "send-bundle", "messages array empty");
+        }
+        const cleaned = msg.messages.map(m => ({
+          address: m && m.address,
+          args: Array.isArray(m && m.args) ? m.args.map(deserializeArg) : []
+        }));
+        // Validate addresses up-front so a single bad entry doesn't
+        // sneak through and surface as a generic encode error.
+        for (const m of cleaned) {
+          if (typeof m.address !== "string" || !m.address.startsWith("/")) {
+            return wsError(ws, "send-bundle", "every bundle element needs an address starting with '/'");
+          }
+        }
+        const host = msg.host || defaultOutHost;
+        const port = Number(msg.port) || defaultOutPort;
+        let packet;
+        try { packet = encodeBundle(cleaned); }
+        catch (e) { return wsError(ws, "send-bundle-encode", e.message); }
+        udp.send(packet, port, host, (err) => {
+          if (err) wsError(ws, "send-bundle-udp", err.message);
         });
       } else if (msg.type === "target") {
         if (typeof msg.host === "string") defaultOutHost = msg.host;
