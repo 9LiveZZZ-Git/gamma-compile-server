@@ -1,30 +1,52 @@
-//! Metal compute-based renderer. Single hard-coded triangle for
-//! sprint 7.5.6.a part 2b -- the per-pixel Möller-Trumbore kernel
-//! we already validated produces the right image to PNG.
+//! Metal renderer with hardware ray-tracing path.
 //!
-//! Part 2c adds the streaming-ready `MetalRenderer` struct that
-//! holds the device + pipeline + reusable output texture so the
-//! WebSocket render loop can render at frame rate without re-
-//! allocating GPU resources per frame.
+//! Sprint 7.5.6.a part 2c. Replaces the inline Möller-Trumbore
+//! intersection from part 2b with `intersector<>` running against a
+//! real `MTLAccelerationStructure`. On Apple9+ GPUs (M3, M4) this
+//! lowers to the dedicated hardware RT cores; on older Apple silicon
+//! (M1, M2) the same MSL compiles to a software-emulated path. The
+//! capability probe at startup reports which path the host supports.
+//!
+//! The AS is built once at MetalRenderer construction. Each frame:
+//!   - bind output texture
+//!   - bind AS at buffer(0)
+//!   - dispatch a 2D grid; each thread casts a ray, the intersector
+//!     traverses the BVH (hardware-side on Apple9+), writes pixel.
+//! No GPU work per-frame besides the kernel dispatch + readback.
 
 use anyhow::{anyhow, Context};
 use metal::{
-    CommandQueue, CompileOptions, ComputePipelineState, Device, MTLOrigin, MTLPixelFormat,
-    MTLRegion, MTLSize, MTLStorageMode, MTLTextureUsage, Texture, TextureDescriptor,
+    AccelerationStructure, AccelerationStructureTriangleGeometryDescriptor, Array,
+    CommandQueue, CompileOptions, ComputePipelineState, Device, MTLAttributeFormat,
+    MTLLanguageVersion, MTLOrigin, MTLPixelFormat, MTLRegion, MTLResourceOptions,
+    MTLResourceUsage, MTLSize, MTLStorageMode, MTLTextureUsage,
+    PrimitiveAccelerationStructureDescriptor, Texture, TextureDescriptor,
 };
 use std::ffi::c_void;
 
 const KERNEL_SRC: &str = include_str!("../shaders/triangle.metal");
 
-/// Reusable Metal renderer. Holds the GPU resources (device, queue,
-/// pipeline, output texture) so the per-frame work is just kernel
-/// dispatch + texture readback. `width` and `height` are fixed at
-/// construction; resizing requires building a new renderer.
+// Triangle in the XY plane at z=0. Same vertices as the editor's
+// DebugTriangle so visual-diffing against the raster path is
+// meaningful. Each row = one vertex (x, y, z).
+const TRIANGLE_VERTICES: [f32; 9] = [
+    -0.866, -0.5, 0.0,
+     0.866, -0.5, 0.0,
+     0.0,    1.0, 0.0,
+];
+
+/// Reusable Metal renderer with a pre-built AS. Holds the GPU
+/// resources (device, queue, pipeline, output texture, AS) so the
+/// per-frame work is just kernel dispatch + texture readback.
 pub struct MetalRenderer {
-    device: Device,
+    _device: Device,
     queue: CommandQueue,
     pipeline: ComputePipelineState,
     texture: Texture,
+    // Acceleration structure must outlive every command buffer that
+    // references it. We build it once in new() and hold it for the
+    // life of the renderer.
+    accel: AccelerationStructure,
     pub width: u32,
     pub height: u32,
 }
@@ -35,7 +57,7 @@ impl MetalRenderer {
             .ok_or_else(|| anyhow!("MTLCreateSystemDefaultDevice returned null"))?;
 
         log::info!(
-            "[metal-renderer] device={:?} {}x{}",
+            "[metal-renderer] device={:?} {}x{} (hardware RT path)",
             device.name(),
             width,
             height
@@ -43,11 +65,62 @@ impl MetalRenderer {
 
         let queue = device.new_command_queue();
 
-        // Default compile options for the basic compute kernel.
-        // Metal 3 with `metal_raytracing` lands in part 2c when we
-        // switch from in-kernel Möller-Trumbore to AS-backed RT.
+        // ── Build the acceleration structure (primitive AS / BLAS). ──
+        // For one triangle the BVH is trivial, but this is the same
+        // code path that'll scale to thousands of primitives in part
+        // 2e once we accept editor-driven scene data. Steps:
+        //   1. Vertex buffer (host-write, GPU-read)
+        //   2. Triangle geometry descriptor pointing at the buffer
+        //   3. Primitive AS descriptor wrapping the geometry
+        //   4. Query size requirements, allocate AS + scratch buffers
+        //   5. Build via the AS command encoder; wait for completion.
+        let vertex_buffer = device.new_buffer_with_data(
+            TRIANGLE_VERTICES.as_ptr() as *const c_void,
+            (TRIANGLE_VERTICES.len() * std::mem::size_of::<f32>()) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+
+        let geom_desc = AccelerationStructureTriangleGeometryDescriptor::descriptor();
+        geom_desc.set_vertex_buffer(Some(&vertex_buffer));
+        geom_desc.set_vertex_buffer_offset(0);
+        geom_desc.set_vertex_stride(std::mem::size_of::<[f32; 3]>() as u64);
+        geom_desc.set_vertex_format(MTLAttributeFormat::Float3);
+        geom_desc.set_triangle_count(1);
+
+        let prim_desc = PrimitiveAccelerationStructureDescriptor::descriptor();
+        let geom_array = Array::from_owned_slice(&[geom_desc.clone()]);
+        prim_desc.set_geometry_descriptors(&geom_array);
+
+        let sizes = device.acceleration_structure_sizes_with_descriptor(&prim_desc);
+        log::info!(
+            "[metal-renderer] AS sizes: storage={}B scratch={}B refit={}B",
+            sizes.acceleration_structure_size,
+            sizes.build_scratch_buffer_size,
+            sizes.refit_scratch_buffer_size
+        );
+
+        let accel = device.new_acceleration_structure_with_size(sizes.acceleration_structure_size);
+        let scratch = device.new_buffer(
+            sizes.build_scratch_buffer_size,
+            MTLResourceOptions::StorageModePrivate,
+        );
+
+        let build_cb = queue.new_command_buffer();
+        let as_enc = build_cb.new_acceleration_structure_command_encoder();
+        as_enc.build_acceleration_structure(&accel, &prim_desc, &scratch, 0);
+        as_enc.end_encoding();
+        build_cb.commit();
+        build_cb.wait_until_completed();
+        log::info!("[metal-renderer] AS build complete (1 primitive)");
+
+        // ── Compile the metal_raytracing kernel ──
+        // intersector<> needs MSL 2.3+; bump the language version on
+        // the compile options so #include <metal_raytracing> resolves
+        // (default is lower on some host SDKs).
+        let options = CompileOptions::new();
+        options.set_language_version(MTLLanguageVersion::V2_4);
         let lib = device
-            .new_library_with_source(KERNEL_SRC, &CompileOptions::new())
+            .new_library_with_source(KERNEL_SRC, &options)
             .map_err(|e| anyhow!("MSL compile failed: {}", e))?;
         let func = lib
             .get_function("rt_triangle", None)
@@ -56,11 +129,8 @@ impl MetalRenderer {
             .new_compute_pipeline_state_with_function(&func)
             .map_err(|e| anyhow!("compute pipeline create failed: {}", e))?;
 
-        // Output texture -- RGBA8Unorm so the bytes serialize cleanly
-        // to PNG (--render-test) AND ship over the WebSocket without
-        // a swizzle pass. Editor side creates a matching
-        // `rgba8unorm` GPUTexture to receive the frame, then samples
-        // it via a fullscreen blit into the bgra8unorm framebuffer.
+        // Output texture -- RGBA8Unorm so bytes serialize cleanly to
+        // PNG (--render-test) AND ship over WebSocket without swizzle.
         let tex_desc = TextureDescriptor::new();
         tex_desc.set_width(width as u64);
         tex_desc.set_height(height as u64);
@@ -70,10 +140,11 @@ impl MetalRenderer {
         let texture = device.new_texture(&tex_desc);
 
         Ok(MetalRenderer {
-            device,
+            _device: device,
             queue,
             pipeline,
             texture,
+            accel,
             width,
             height,
         })
@@ -88,6 +159,11 @@ impl MetalRenderer {
         let enc = cb.new_compute_command_encoder();
         enc.set_compute_pipeline_state(&self.pipeline);
         enc.set_texture(0, Some(&self.texture));
+        // Bind the AS at buffer slot 0 (matches [[buffer(0)]] in MSL).
+        // use_resource ensures the AS pages are resident before the
+        // dispatch; without it the GPU could fault on the BVH lookup.
+        enc.set_acceleration_structure(Some(&self.accel), 0);
+        enc.use_resource(&self.accel, MTLResourceUsage::Read);
 
         let tg_size = MTLSize { width: 16, height: 16, depth: 1 };
         let tg_count = MTLSize {
