@@ -6,6 +6,10 @@
 //! Sprint 7.5.6.a part 1: types only. Actual deserialization +
 //! engine consumption land in part 2.
 
+// Suppress unused warnings for the part-1 scaffolding -- everything
+// here gets consumed by the renderer in part 2.
+#![allow(dead_code)]
+
 use glam::{Mat4, Vec3};
 use serde::{Deserialize, Serialize};
 

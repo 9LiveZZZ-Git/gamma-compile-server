@@ -35,6 +35,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
+#[allow(dead_code)] // Configure/Scene/Params field bodies are part 2 work.
 enum ClientMsg {
     Hello,
     Configure { width: u32, height: u32 },
