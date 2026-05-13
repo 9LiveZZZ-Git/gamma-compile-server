@@ -98,15 +98,32 @@ export function attachRtProxy({
 
     log("upgrading; bridging to " + engineHost + ":" + enginePort);
 
+    // Match the socket-setup that ws.WebSocketServer.completeUpgrade
+    // does before writing the 101: disable inactivity timeout +
+    // disable Nagle. Without setNoDelay our 101 (a small write)
+    // can get coalesced with later writes in a way that confuses
+    // Chrome's WS-frame parser right after onopen.
+    try {
+      clientSocket.setTimeout(0);
+      clientSocket.setNoDelay(true);
+    } catch (e) {
+      log("setTimeout/setNoDelay threw: " + e.message);
+    }
+
     // ── STEP 1: answer the browser with our own 101 right now.
     // This is what Chrome was waiting for. Without it Chrome
     // bails at ~+3ms.
     const accept = wsAccept(wsKey);
+    // Include Access-Control-Allow-Private-Network for Chrome's PNA
+    // policy (public origin → private network). The compile-server's
+    // Express middleware sets this on HTTP responses; the upgrade
+    // handler bypasses Express so we have to set it ourselves here.
     const proxy101 =
       "HTTP/1.1 101 Switching Protocols\r\n" +
       "Upgrade: websocket\r\n" +
       "Connection: Upgrade\r\n" +
       "Sec-WebSocket-Accept: " + accept + "\r\n" +
+      "Access-Control-Allow-Private-Network: true\r\n" +
       "\r\n";
     try {
       clientSocket.write(proxy101);
@@ -115,7 +132,25 @@ export function attachRtProxy({
       try { clientSocket.destroy(); } catch (_) {}
       return;
     }
-    log("sent proxy 101 to browser");
+    log("sent proxy 101 to browser (+ PNA header + setNoDelay)");
+
+    // Belt-and-suspenders: immediately follow with a server-sent
+    // WS PING frame (opcode 0x9, no mask, no payload). This is
+    // 2 bytes (0x89 0x00) and is a known-valid frame. It proves
+    // to Chrome's parser that the post-handshake channel is
+    // delivering correctly-framed data, in case Chrome's WS
+    // implementation has some "first-frame timeout" heuristic.
+    // Browser will respond with a PONG which we just ignore
+    // (forwarding the bytes to the engine before its handshake
+    // finishes would confuse tungstenite -- so we drop client
+    // bytes that are 2-byte PONG frames before engine handshake
+    // is stripped; see browserBuffer handling below).
+    try {
+      clientSocket.write(Buffer.from([0x89, 0x00]));
+      log("sent server PING after 101");
+    } catch (e) {
+      log("could not write server PING: " + e.message);
+    }
 
     // ── STEP 2: open the engine TCP and start its own handshake
     // in parallel. The engine will send its OWN 101 back through
