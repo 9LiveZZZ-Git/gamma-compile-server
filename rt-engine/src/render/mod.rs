@@ -12,7 +12,7 @@
 pub mod metal_path;
 
 #[cfg(target_os = "macos")]
-pub use metal_path::render_test_triangle;
+pub use metal_path::{render_test_triangle, MetalRenderer};
 
 #[cfg(not(target_os = "macos"))]
 pub fn render_test_triangle(
@@ -23,4 +23,27 @@ pub fn render_test_triangle(
     Err(anyhow::anyhow!(
         "--render-test currently requires macOS. PC Vulkan-RT path lands in §5.6.b."
     ))
+}
+
+/// Stream-friendly renderer trait that the IPC layer can use without
+/// caring whether the backend is Metal or Vulkan. Both backends
+/// expose the same shape: build once at fixed dimensions, render a
+/// frame to a CPU-readable buffer. The streaming path doesn't
+/// allocate per frame -- GPU resources are kept alive between calls.
+#[cfg(target_os = "macos")]
+pub type Renderer = metal_path::MetalRenderer;
+
+#[cfg(not(target_os = "macos"))]
+pub struct Renderer;
+
+#[cfg(not(target_os = "macos"))]
+impl Renderer {
+    pub fn new(_w: u32, _h: u32) -> anyhow::Result<Self> {
+        Err(anyhow::anyhow!("RT engine streaming requires macOS in part 2c; PC support lands in §5.6.b"))
+    }
+    pub fn render_frame(&self) -> anyhow::Result<Vec<u8>> {
+        Err(anyhow::anyhow!("RT engine streaming requires macOS in part 2c"))
+    }
+    pub fn width(&self) -> u32 { 0 }
+    pub fn height(&self) -> u32 { 0 }
 }

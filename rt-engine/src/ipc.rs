@@ -1,41 +1,43 @@
 //! WebSocket IPC between the Node compile-server (proxy) and the
 //! Rust engine. Wire protocol is JSON for control messages + raw
-//! binary frames for H.264 NAL units once streaming lands in part 2.
+//! binary frames for raw RGBA8 pixel data once streaming starts.
 //!
 //! Control messages (text frames, JSON):
 //!
 //!   client → engine:
 //!     {type: "hello"}                         handshake
-//!     {type: "configure", width, height}      stream init
-//!     {type: "scene", patch: {...}}           scene update (full)
-//!     {type: "params", patch: {...}}          partial param update
+//!     {type: "configure", width, height}      stream init (resizes the renderer)
+//!     {type: "scene", patch: {...}}           full scene update     (part 2d)
+//!     {type: "params", patch: {...}}          partial param update  (part 2d)
 //!     {type: "render-start"}                  begin streaming frames
 //!     {type: "render-stop"}                   pause streaming
 //!     {type: "shutdown"}                      clean engine exit
 //!
 //!   engine → client:
 //!     {type: "hello", version, capabilities, backend}   handshake reply
-//!     {type: "frame-config", codec, width, height}      stream config
-//!     <binary>                                          encoded NAL units (H.264)
+//!     {type: "frame-config", width, height, format}     stream config
+//!     <binary>                                          raw RGBA8 pixel data
 //!     {type: "error", where, message}                   non-fatal error
 //!
-//! Sprint 7.5.6.a part 1: only the handshake works. Subsequent
-//! messages are parsed but not yet acted upon (the engine just
-//! echoes a "not-yet-implemented" reply).
+//! Sprint 7.5.6.a part 2c (this commit): render-start / render-stop
+//! drive an actual Metal render loop. Each frame goes out as a
+//! binary message containing width * height * 4 bytes of RGBA8.
 
 use crate::backend::BackendKind;
 use crate::capability::Capabilities;
+use crate::render::Renderer;
 use anyhow::Context;
 use futures_util::{SinkExt, StreamExt};
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio_tungstenite::accept_async;
 use tokio_tungstenite::tungstenite::Message;
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
-#[allow(dead_code)] // Configure/Scene/Params field bodies are part 2 work.
+#[allow(dead_code)] // Scene / Params field bodies are part 2d work.
 enum ClientMsg {
     Hello,
     Configure { width: u32, height: u32 },
@@ -54,14 +56,21 @@ enum EngineMsg<'a> {
         backend: &'a str,
         capabilities: &'a Capabilities,
     },
+    FrameConfig {
+        width: u32,
+        height: u32,
+        format: &'a str,
+    },
     Error {
+        #[serde(rename = "where")]
         where_: &'a str,
         message: &'a str,
     },
-    NotImplemented {
-        feature: &'a str,
-    },
 }
+
+const DEFAULT_WIDTH: u32 = 800;
+const DEFAULT_HEIGHT: u32 = 600;
+const TARGET_FRAME_INTERVAL_MS: u64 = 33; // ~30 fps
 
 pub async fn serve(
     host: &str,
@@ -97,63 +106,183 @@ async fn handle_connection(
     let ws_stream = accept_async(stream).await.context("ws handshake failed")?;
     let (mut tx, mut rx) = ws_stream.split();
 
-    while let Some(msg) = rx.next().await {
-        let msg = msg.context("ws recv failed")?;
-        match msg {
-            Message::Text(text) => {
-                let parsed: Result<ClientMsg, _> = serde_json::from_str(&text);
-                match parsed {
-                    Ok(ClientMsg::Hello) => {
-                        let reply = EngineMsg::Hello {
-                            version: env!("CARGO_PKG_VERSION"),
-                            backend: &backend_str,
-                            capabilities: &caps,
-                        };
-                        tx.send(Message::Text(serde_json::to_string(&reply)?.into()))
-                            .await?;
-                    }
-                    Ok(ClientMsg::Shutdown) => {
-                        info!("client requested shutdown; exiting");
+    // Per-connection rendering state. Renderer is built lazily on
+    // first render-start so a client that only does --probe-style
+    // hello+shutdown doesn't pay the GPU init cost.
+    let mut renderer: Option<Renderer> = None;
+    let mut rendering = false;
+    let mut want_dims = (DEFAULT_WIDTH, DEFAULT_HEIGHT);
+    let mut frame_counter: u64 = 0;
+
+    let mut tick = tokio::time::interval(Duration::from_millis(TARGET_FRAME_INTERVAL_MS));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        tokio::select! {
+            biased;
+            msg = rx.next() => {
+                let msg = match msg {
+                    Some(Ok(m)) => m,
+                    Some(Err(e)) => {
+                        warn!("ws recv error: {}", e);
                         return Ok(());
                     }
-                    Ok(ClientMsg::Configure { .. })
-                    | Ok(ClientMsg::Scene { .. })
-                    | Ok(ClientMsg::Params { .. })
-                    | Ok(ClientMsg::RenderStart)
-                    | Ok(ClientMsg::RenderStop) => {
-                        // Part 1: just acknowledge; the actual render
-                        // pipeline + streaming lands in part 2.
-                        let reply = EngineMsg::NotImplemented {
-                            feature: "render pipeline (§5.6.a part 2)",
-                        };
-                        tx.send(Message::Text(serde_json::to_string(&reply)?.into()))
-                            .await?;
+                    None => return Ok(()),
+                };
+                if !handle_client_msg(
+                    msg,
+                    &mut tx,
+                    &caps,
+                    &backend_str,
+                    &mut renderer,
+                    &mut rendering,
+                    &mut want_dims,
+                ).await? {
+                    // Returned false = clean shutdown requested.
+                    return Ok(());
+                }
+            }
+            _ = tick.tick(), if rendering => {
+                // Ensure renderer exists at the right dimensions.
+                let need_new = renderer
+                    .as_ref()
+                    .map(|r| r.width != want_dims.0 || r.height != want_dims.1)
+                    .unwrap_or(true);
+                if need_new {
+                    match Renderer::new(want_dims.0, want_dims.1) {
+                        Ok(r) => {
+                            // Notify client of the actual stream
+                            // dimensions (defaults if no configure
+                            // was sent).
+                            let cfg = EngineMsg::FrameConfig {
+                                width: r.width,
+                                height: r.height,
+                                format: "rgba8unorm",
+                            };
+                            tx.send(Message::Text(serde_json::to_string(&cfg)?.into())).await?;
+                            renderer = Some(r);
+                            frame_counter = 0;
+                            info!("[stream] renderer ready: {}x{}", want_dims.0, want_dims.1);
+                        }
+                        Err(e) => {
+                            warn!("[stream] renderer build failed: {}", e);
+                            rendering = false;
+                            let err_msg = format!("{}", e);
+                            let err = EngineMsg::Error {
+                                where_: "render-init",
+                                message: &err_msg,
+                            };
+                            tx.send(Message::Text(serde_json::to_string(&err)?.into())).await?;
+                            continue;
+                        }
                     }
-                    Err(e) => {
-                        let err_msg = format!("invalid client message: {}", e);
-                        let reply = EngineMsg::Error {
-                            where_: "parse",
-                            message: &err_msg,
-                        };
-                        tx.send(Message::Text(serde_json::to_string(&reply)?.into()))
-                            .await?;
+                }
+                // Render + send.
+                if let Some(r) = renderer.as_ref() {
+                    match r.render_frame() {
+                        Ok(pixels) => {
+                            // Log every 60th frame so we know
+                            // it's still alive without spamming.
+                            frame_counter += 1;
+                            if frame_counter % 60 == 1 {
+                                info!("[stream] frame {} ({} bytes)", frame_counter, pixels.len());
+                            }
+                            if tx.send(Message::Binary(pixels.into())).await.is_err() {
+                                return Ok(());
+                            }
+                        }
+                        Err(e) => {
+                            warn!("[stream] render error: {}", e);
+                            rendering = false;
+                            let err_msg = format!("{}", e);
+                            let err = EngineMsg::Error {
+                                where_: "render-frame",
+                                message: &err_msg,
+                            };
+                            tx.send(Message::Text(serde_json::to_string(&err)?.into())).await?;
+                        }
                     }
                 }
             }
-            Message::Binary(_) => {
-                // Client → engine binary is reserved for future use.
-                let reply = EngineMsg::Error {
-                    where_: "binary",
-                    message: "binary client → engine not currently expected",
-                };
-                tx.send(Message::Text(serde_json::to_string(&reply)?.into()))
-                    .await?;
-            }
-            Message::Close(_) => return Ok(()),
-            Message::Ping(p) => tx.send(Message::Pong(p)).await?,
-            Message::Pong(_) => {}
-            Message::Frame(_) => {} // shouldn't happen with default config
         }
     }
-    Ok(())
+}
+
+/// Handle one inbound message. Returns `Ok(false)` on shutdown
+/// request (clean exit), `Ok(true)` to keep the loop alive,
+/// `Err(_)` on a fatal error.
+async fn handle_client_msg(
+    msg: Message,
+    tx: &mut futures_util::stream::SplitSink<
+        tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+        Message,
+    >,
+    caps: &Capabilities,
+    backend_str: &str,
+    renderer: &mut Option<Renderer>,
+    rendering: &mut bool,
+    want_dims: &mut (u32, u32),
+) -> anyhow::Result<bool> {
+    match msg {
+        Message::Text(text) => {
+            let parsed: Result<ClientMsg, _> = serde_json::from_str(&text);
+            match parsed {
+                Ok(ClientMsg::Hello) => {
+                    let reply = EngineMsg::Hello {
+                        version: env!("CARGO_PKG_VERSION"),
+                        backend: backend_str,
+                        capabilities: caps,
+                    };
+                    tx.send(Message::Text(serde_json::to_string(&reply)?.into())).await?;
+                }
+                Ok(ClientMsg::Configure { width, height }) => {
+                    *want_dims = (width.max(1).min(4096), height.max(1).min(4096));
+                    info!("[stream] configure: {}x{}", want_dims.0, want_dims.1);
+                    // Force renderer rebuild on next tick if rendering.
+                    *renderer = None;
+                }
+                Ok(ClientMsg::RenderStart) => {
+                    *rendering = true;
+                    info!("[stream] render-start (dims {}x{})", want_dims.0, want_dims.1);
+                }
+                Ok(ClientMsg::RenderStop) => {
+                    *rendering = false;
+                    info!("[stream] render-stop");
+                }
+                Ok(ClientMsg::Shutdown) => {
+                    info!("[stream] shutdown requested");
+                    return Ok(false);
+                }
+                Ok(ClientMsg::Scene { .. }) | Ok(ClientMsg::Params { .. }) => {
+                    // Scene state updates land in part 2d. For now the
+                    // engine renders its hard-coded triangle regardless.
+                    let err = EngineMsg::Error {
+                        where_: "scene",
+                        message: "scene state updates land in §5.6.a part 2d; rendering hard-coded triangle for now",
+                    };
+                    tx.send(Message::Text(serde_json::to_string(&err)?.into())).await?;
+                }
+                Err(e) => {
+                    let err_msg = format!("invalid client message: {}", e);
+                    let err = EngineMsg::Error {
+                        where_: "parse",
+                        message: &err_msg,
+                    };
+                    tx.send(Message::Text(serde_json::to_string(&err)?.into())).await?;
+                }
+            }
+        }
+        Message::Binary(_) => {
+            let err = EngineMsg::Error {
+                where_: "binary",
+                message: "binary client → engine not currently expected",
+            };
+            tx.send(Message::Text(serde_json::to_string(&err)?.into())).await?;
+        }
+        Message::Close(_) => return Ok(false),
+        Message::Ping(p) => tx.send(Message::Pong(p)).await?,
+        Message::Pong(_) => {}
+        Message::Frame(_) => {}
+    }
+    Ok(true)
 }
