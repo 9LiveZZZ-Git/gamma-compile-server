@@ -11,6 +11,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { compile } from "./compile.js";
 import { startOscBridge } from "./osc-bridge.js";
+import { probeEngine } from "./rt-engine-host.js";
 
 // Read package version once at startup so /health reports the actual
 // running version. Better than hardcoding a string that drifts on bumps.
@@ -79,6 +80,17 @@ export async function startServer({
 
   app.use(express.json({ limit: "2mb" }));
 
+  // Sprint 7.5.6.a part 1 -- probe the rt-engine binary at server
+  // start. The result is reported back via /health so the editor
+  // knows whether to enable the RayTracedScene node. Falls through
+  // silently if the engine isn't installed (it's optional).
+  let rtEngineInfo = null;
+  try {
+    rtEngineInfo = await probeEngine(cacheDir);
+  } catch (e) {
+    console.warn("[rt-engine] probe threw:", e && e.message);
+  }
+
   app.get("/health", (req, res) => {
     res.json({
       ok: true,
@@ -92,7 +104,19 @@ export async function startServer({
       osc: osc
         ? { enabled: true, wsPath: "/osc", inPort: oscInPort,
             defaultOut: { host: oscOutHost, port: oscOutPort } }
-        : { enabled: false }
+        : { enabled: false },
+      // Sprint 7.5.6.a part 1 -- RT engine availability. The
+      // editor's RayTracedScene node reads this to decide whether
+      // to offer RT rendering or fall back to raster Scene.
+      rtEngine: rtEngineInfo
+        ? { available: true,
+            capabilities: rtEngineInfo.capabilities,
+            wsPath: "/rt",
+            // The /rt proxy itself lands in §5.6.a part 2; for now
+            // the editor knows the engine EXISTS but rendering
+            // requests will fail until the proxy is built.
+            proxyReady: false }
+        : { available: false }
     });
   });
 

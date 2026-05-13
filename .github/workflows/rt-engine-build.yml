@@ -1,0 +1,105 @@
+name: rt-engine build
+
+# Builds the gamma-rt-engine Rust binary for the three target platforms
+# and publishes them as GitHub release artifacts. The Node-side
+# gamma-compile-server fetches the matching binary on first RT use.
+#
+# Triggered on:
+#   - tag push matching rt-engine-v*  (releases the binary)
+#   - manual workflow_dispatch         (test builds without releasing)
+#   - PR with rt-engine/ changes       (CI-only, no upload)
+
+on:
+  push:
+    tags:
+      - 'rt-engine-v*'
+  pull_request:
+    paths:
+      - 'rt-engine/**'
+      - '.github/workflows/rt-engine-build.yml'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Windows: NVIDIA / AMD / Intel via Vulkan-RT
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: gamma-rt-engine-windows-x86_64.exe
+            binary: gamma-rt-engine.exe
+          # Linux: same backend
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: gamma-rt-engine-linux-x86_64
+            binary: gamma-rt-engine
+          # macOS Apple Silicon: Metal-RT
+          - os: macos-14
+            target: aarch64-apple-darwin
+            artifact: gamma-rt-engine-macos-arm64
+            binary: gamma-rt-engine
+          # macOS Intel: Metal but no hardware RT -- still build for
+          # the rare Intel Mac user; falls back to MPS software path.
+          - os: macos-13
+            target: x86_64-apple-darwin
+            artifact: gamma-rt-engine-macos-x86_64
+            binary: gamma-rt-engine
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rt-engine/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('rt-engine/Cargo.lock') }}
+
+      # Linux: install Vulkan SDK for the build. macOS + Windows have
+      # what they need via the metal/ash crates' bundled bindings.
+      - name: Install Vulkan SDK (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          wget -qO - https://packages.lunarg.com/lunarg-signing-key-pub.asc | sudo apt-key add -
+          sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-jammy.list https://packages.lunarg.com/vulkan/lunarg-vulkan-jammy.list
+          sudo apt-get update
+          sudo apt-get install -y vulkan-sdk libwayland-dev libxkbcommon-dev
+
+      - name: Build (release)
+        working-directory: rt-engine
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Rename binary for upload
+        shell: bash
+        working-directory: rt-engine
+        run: |
+          mkdir -p ../dist
+          cp target/${{ matrix.target }}/release/${{ matrix.binary }} ../dist/${{ matrix.artifact }}
+
+      - name: Upload artifact (CI / dispatch)
+        if: github.event_name != 'push' || !startsWith(github.ref, 'refs/tags/')
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/${{ matrix.artifact }}
+
+      - name: Upload to release (tag push)
+        if: startsWith(github.ref, 'refs/tags/rt-engine-v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/${{ matrix.artifact }}
+          fail_on_unmatched_files: false
