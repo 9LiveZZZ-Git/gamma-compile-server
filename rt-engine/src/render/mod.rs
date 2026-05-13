@@ -12,7 +12,7 @@
 pub mod metal_path;
 
 #[cfg(target_os = "macos")]
-pub use metal_path::{render_test_triangle, MetalRenderer};
+pub use metal_path::render_test_triangle;
 
 #[cfg(not(target_os = "macos"))]
 pub fn render_test_triangle(

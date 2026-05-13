@@ -88,8 +88,16 @@ impl MetalRenderer {
         geom_desc.set_triangle_count(1);
 
         let prim_desc = PrimitiveAccelerationStructureDescriptor::descriptor();
-        let geom_array = Array::from_owned_slice(&[geom_desc.clone()]);
-        prim_desc.set_geometry_descriptors(&geom_array);
+        // metal-rs's set_geometry_descriptors wants
+        // &ArrayRef<AccelerationStructureGeometryDescriptor> (base type).
+        // Triangle is a subclass; the .into() bumps the refcount and
+        // upcasts the ObjC pointer. from_owned_slice returns the
+        // ArrayRef directly (no extra `&` needed when passing to the
+        // setter).
+        let geom_array: &metal::ArrayRef<
+            metal::AccelerationStructureGeometryDescriptor,
+        > = Array::from_owned_slice(&[geom_desc.clone().into()]);
+        prim_desc.set_geometry_descriptors(geom_array);
 
         let sizes = device.acceleration_structure_sizes_with_descriptor(&prim_desc);
         log::info!(
@@ -160,9 +168,12 @@ impl MetalRenderer {
         enc.set_compute_pipeline_state(&self.pipeline);
         enc.set_texture(0, Some(&self.texture));
         // Bind the AS at buffer slot 0 (matches [[buffer(0)]] in MSL).
+        // metal-rs signature is (at_buffer_index, Option<&Ref>); the
+        // &*self.accel forces Deref from owning AccelerationStructure
+        // to AccelerationStructureRef before Some() wraps it.
         // use_resource ensures the AS pages are resident before the
         // dispatch; without it the GPU could fault on the BVH lookup.
-        enc.set_acceleration_structure(Some(&self.accel), 0);
+        enc.set_acceleration_structure(0, Some(&*self.accel));
         enc.use_resource(&self.accel, MTLResourceUsage::Read);
 
         let tg_size = MTLSize { width: 16, height: 16, depth: 1 };
