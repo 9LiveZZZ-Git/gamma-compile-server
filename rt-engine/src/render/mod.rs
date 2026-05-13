@@ -33,17 +33,24 @@ pub fn render_test_triangle(
 #[cfg(target_os = "macos")]
 pub type Renderer = metal_path::MetalRenderer;
 
+// Non-macOS stub. Fields match the MetalRenderer's public surface so
+// ipc.rs can use field access (r.width) identically on both
+// platforms. The constructor always returns Err since this is just
+// a compilation placeholder until §5.6.b lands the Vulkan backend.
 #[cfg(not(target_os = "macos"))]
-pub struct Renderer;
+pub struct Renderer {
+    pub width: u32,
+    pub height: u32,
+}
 
 #[cfg(not(target_os = "macos"))]
 impl Renderer {
     pub fn new(_w: u32, _h: u32) -> anyhow::Result<Self> {
-        Err(anyhow::anyhow!("RT engine streaming requires macOS in part 2c; PC support lands in §5.6.b"))
+        Err(anyhow::anyhow!(
+            "RT engine streaming requires macOS in part 2c; PC Vulkan-RT support lands in §5.6.b"
+        ))
     }
     pub fn render_frame(&self) -> anyhow::Result<Vec<u8>> {
         Err(anyhow::anyhow!("RT engine streaming requires macOS in part 2c"))
     }
-    pub fn width(&self) -> u32 { 0 }
-    pub fn height(&self) -> u32 { 0 }
 }
