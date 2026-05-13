@@ -1,35 +1,48 @@
-// rt-proxy.js -- TCP-level forward between the browser editor + the
-// local gamma-rt-engine binary. Sprint 7.5.6.a part 2d.
+// rt-proxy.js -- WebSocket reverse-proxy with split-handshake.
+// Sprint 7.5.6.a part 2d, attempt 3.
 //
-// The browser editor opens a WebSocket to this compile-server's
-// /rt path (typically https://9livezzz-git.github.io ↔ ws://localhost:8765/rt).
-// We intercept the raw HTTP upgrade request, open a plain TCP socket
-// to the engine's WebSocket port (default 127.0.0.1:9100), replay
-// the original GET-Upgrade request bytes to it, then bidirectionally
-// pipe the two sockets together. The WS handshake happens between
-// the BROWSER and the ENGINE directly -- the proxy only shuffles
-// bytes.
+// History:
+//   v1: ws.WebSocketServer both sides. Worked for handshake but
+//       frame reframing produced "Invalid frame header" in Chrome.
+//   v2: raw TCP forward both sides. Engine handshake completed
+//       cleanly when bytes arrived, but Chrome closes the browser
+//       end at +3ms because no 101 ever arrives -- the proxy was
+//       waiting for the engine's 101 to forward back. Browser is
+//       impatient on localhost and aborts.
+//   v3 (this): proxy answers the browser's WS upgrade WITH ITS
+//       OWN 101 immediately (computed from Sec-WebSocket-Key);
+//       the browser sees onopen synchronously. In parallel, the
+//       proxy opens a TCP socket to the engine, forwards the
+//       original upgrade request, then strips the engine's 101
+//       response and pipes only the WS frame bytes through
+//       afterwards.
 //
-// Why not use `ws` library both sides? The original design did that
-// (browser ↔ ws.WebSocketServer on the proxy, ws.WebSocket on the
-// proxy → engine.tokio-tungstenite). Two WS endpoints in series
-// means TWO handshakes + reframing in the middle. Chrome rejected
-// the resulting frames with "Invalid frame header", and the
-// proxy → engine handshake itself failed with tungstenite's
-// "Handshake not finished" -- proxy was closing the half-open
-// engine WS while the browser was still in handshake flux.
+// Result: one logical WS session (browser ↔ engine in spirit), two
+// handshakes that complete independently, no frame reframing. The
+// proxy only stripping the engine's 101 prefix once -- the rest
+// is raw byte forwarding.
 //
-// TCP-level forward sidesteps all of that. One handshake (browser
-// ↔ engine). Identical framing both sides. The proxy is invisible
-// to the WS protocol.
+// Extension handling: we DO NOT forward Sec-WebSocket-Extensions
+// to the engine. The proxy advertises NO extensions in its 101 to
+// the browser, so the browser uses uncompressed frames. The engine
+// also gets a request with no extensions, so it responds with no
+// extensions. Both sides agree -- uncompressed frames flow through
+// the byte pipe.
 //
 // User must start the engine manually for now:
 //   ./rt-engine/target/release/gamma-rt-engine --port 9100
-// Auto-spawn lands in a follow-up; the cleanest UX is for the
-// compile-server to start the engine on first /rt connection,
-// but that needs binary-discovery polish + lifecycle management.
+// Auto-spawn lands in a follow-up.
 
 import net from "node:net";
+import crypto from "node:crypto";
+
+const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+
+function wsAccept(secWebSocketKey) {
+  return crypto.createHash("sha1")
+    .update(secWebSocketKey + WS_GUID)
+    .digest("base64");
+}
 
 export function attachRtProxy({
   httpServer,
@@ -39,25 +52,21 @@ export function attachRtProxy({
   allowAnyOrigin = false,
   logger = console
 }) {
-  // We attach to the underlying Node HTTP server's `upgrade` event
-  // directly instead of wrapping the socket in a ws.WebSocketServer.
-  // Multiple `upgrade` listeners can coexist on the same httpServer
-  // (the OSC bridge attaches its own ws.WebSocketServer for /osc;
-  // its handler checks path filter and ignores non-/osc upgrades).
-  // Same pattern here -- we only claim sockets whose URL is /rt.
   httpServer.on("upgrade", (req, clientSocket, head) => {
     if (req.url !== "/rt") return;
 
-    // Origin check -- same policy as the OSC bridge. Same defaults
-    // (GH Pages + localhost dev ports). On reject we write a raw
-    // 403 + destroy.
+    const peer = clientSocket.remoteAddress + ":" + clientSocket.remotePort;
+    const t0 = Date.now();
+    const log = (msg) => logger.log("[rt-proxy] +" + (Date.now() - t0) + "ms " + peer + " " + msg);
+
+    // Origin check.
     const origin = req.headers.origin || "";
     const originOk =
       allowAnyOrigin ||
-      !origin ||  // curl / direct connection
+      !origin ||
       (allowedOrigins && allowedOrigins.has(origin));
     if (!originOk) {
-      logger.warn("[rt-proxy] rejected origin: " + origin);
+      log("rejected origin: " + origin);
       clientSocket.write(
         "HTTP/1.1 403 Forbidden\r\n" +
         "Content-Type: text/plain\r\n" +
@@ -69,135 +78,159 @@ export function attachRtProxy({
       return;
     }
 
-    const peer = clientSocket.remoteAddress + ":" + clientSocket.remotePort;
-    const t0 = Date.now();
-    const log = (msg) => logger.log("[rt-proxy] +" + (Date.now() - t0) + "ms " + peer + " " + msg);
-    log("upgrading; TCP forward → " + engineHost + ":" + enginePort);
+    // Validate the WS upgrade. We need a Sec-WebSocket-Key to compute
+    // the Accept hash. Missing key = malformed request; refuse.
+    const upgrade = (req.headers.upgrade || "").toLowerCase();
+    const wsKey = req.headers["sec-websocket-key"];
+    const wsVersion = req.headers["sec-websocket-version"];
+    if (upgrade !== "websocket" || !wsKey || wsVersion !== "13") {
+      log("bad upgrade headers: upgrade=" + upgrade + " key=" + !!wsKey + " ver=" + wsVersion);
+      clientSocket.write(
+        "HTTP/1.1 400 Bad Request\r\n" +
+        "Content-Type: text/plain\r\n" +
+        "Connection: close\r\n" +
+        "\r\n" +
+        "Bad WebSocket upgrade request"
+      );
+      clientSocket.destroy();
+      return;
+    }
 
-    // Open raw TCP to the engine.
+    log("upgrading; bridging to " + engineHost + ":" + enginePort);
+
+    // ── STEP 1: answer the browser with our own 101 right now.
+    // This is what Chrome was waiting for. Without it Chrome
+    // bails at ~+3ms.
+    const accept = wsAccept(wsKey);
+    const proxy101 =
+      "HTTP/1.1 101 Switching Protocols\r\n" +
+      "Upgrade: websocket\r\n" +
+      "Connection: Upgrade\r\n" +
+      "Sec-WebSocket-Accept: " + accept + "\r\n" +
+      "\r\n";
+    try {
+      clientSocket.write(proxy101);
+    } catch (e) {
+      log("could not write proxy 101: " + e.message);
+      try { clientSocket.destroy(); } catch (_) {}
+      return;
+    }
+    log("sent proxy 101 to browser");
+
+    // ── STEP 2: open the engine TCP and start its own handshake
+    // in parallel. The engine will send its OWN 101 back through
+    // this socket; we strip it before forwarding any subsequent
+    // bytes to the browser.
     const engineSocket = net.connect({ host: engineHost, port: enginePort });
 
-    let engineConnected = false;
-    let upgradeWritten = false;
-    let buffered = [];  // bytes from client we received before engine TCP opens
+    let engineHandshakeStripped = false;
+    let engineStripBuf = Buffer.alloc(0);
+    let browserBuffer = [];   // browser frames received before engine handshake completes
 
-    // ── Build the upgrade request EARLY (in this synchronous tick) so
-    // we don't depend on `req` still being valid when 'connect' fires
-    // later. Logging its size + first line confirms what we're going
-    // to forward.
-    let upgradeRequest = "GET " + req.url + " HTTP/" + req.httpVersion + "\r\n";
+    // Build the upgrade request to send to the engine. We strip
+    // Sec-WebSocket-Extensions and Sec-WebSocket-Protocol so the
+    // engine doesn't negotiate extensions that the browser (via
+    // our 101) thinks are off.
+    let engineUpgradeRequest = "GET " + req.url + " HTTP/1.1\r\n";
     for (const [key, value] of Object.entries(req.headers)) {
+      if (key === "sec-websocket-extensions" || key === "sec-websocket-protocol") continue;
       if (Array.isArray(value)) {
-        for (const v of value) upgradeRequest += key + ": " + v + "\r\n";
+        for (const v of value) engineUpgradeRequest += key + ": " + v + "\r\n";
       } else {
-        upgradeRequest += key + ": " + value + "\r\n";
+        engineUpgradeRequest += key + ": " + value + "\r\n";
       }
     }
-    upgradeRequest += "\r\n";
-    log("constructed upgrade request (" + upgradeRequest.length + " bytes):");
-    // Dump the raw request so we can see EXACTLY what tungstenite sees.
-    // Indent each line so it's distinguishable in the log.
-    for (const line of upgradeRequest.split("\r\n")) {
-      if (line) logger.log("[rt-proxy]   | " + line);
-    }
-
-    // Client → engine. Until engineSocket is connected, buffer the
-    // bytes. After connect, write them then pipe directly.
-    clientSocket.on("data", (chunk) => {
-      log("client→ " + chunk.length + "B (engineConnected=" + engineConnected + ")");
-      if (engineConnected) {
-        engineSocket.write(chunk);
-      } else {
-        buffered.push(chunk);
-      }
-    });
+    engineUpgradeRequest += "\r\n";
 
     engineSocket.on("connect", () => {
-      log("engineSocket 'connect' event");
+      log("engineSocket connected; writing " + engineUpgradeRequest.length + "B upgrade");
       try {
-        engineConnected = true;
-        log("writing " + upgradeRequest.length + "B upgrade request to engine");
-        engineSocket.write(upgradeRequest);
-        upgradeWritten = true;
-        if (head && head.length) {
-          log("writing " + head.length + "B head bytes to engine");
-          engineSocket.write(head);
-        }
-        if (buffered.length) {
-          let total = 0;
-          for (const chunk of buffered) total += chunk.length;
-          log("flushing " + buffered.length + " buffered chunks (" + total + "B) to engine");
-          for (const chunk of buffered) engineSocket.write(chunk);
-          buffered = [];
-        }
+        engineSocket.write(engineUpgradeRequest);
+        if (head && head.length) engineSocket.write(head);
       } catch (e) {
-        logger.error("[rt-proxy] +" + (Date.now() - t0) + "ms " + peer +
-                     " THREW in connect handler: " + e.message + "\n" + e.stack);
+        log("engine write threw: " + e.message);
+        closeBoth();
       }
     });
 
-    // Engine → client: straight pipe. The first bytes will be the
-    // 101 Switching Protocols response from tokio-tungstenite, which
-    // the browser consumes to complete its handshake. After that:
-    // WS frames in both directions, opaque to us.
+    // Browser → engine. Browser starts sending WS frames as soon as
+    // its onopen fires (immediately after our 101). We buffer them
+    // until the engine has finished its own handshake; otherwise the
+    // engine's tokio-tungstenite parser sees WS frame bytes mid-HTTP
+    // parse and bombs with "Handshake not finished".
+    clientSocket.on("data", (chunk) => {
+      log("client→ " + chunk.length + "B (engineHandshakeStripped=" + engineHandshakeStripped + ")");
+      if (engineHandshakeStripped) {
+        try { engineSocket.write(chunk); } catch (_) {}
+      } else {
+        browserBuffer.push(chunk);
+      }
+    });
+
+    // Engine → browser. First N bytes are the engine's 101 response;
+    // we discard everything up to and including the first \r\n\r\n.
+    // After that all bytes are WS frames -- forward verbatim.
     engineSocket.on("data", (chunk) => {
       log("engine→ " + chunk.length + "B");
-      // First chunk is the HTTP response -- dump its preamble so we
-      // can see the engine's 101 response (or whatever error it
-      // wrote instead).
-      if (chunk.length > 0 && chunk.length < 4096) {
-        try {
-          const preview = chunk.toString("utf8").split("\r\n").slice(0, 8).join(" | ");
-          log("engine response preamble: " + preview.slice(0, 400));
-        } catch (_) {}
+      if (engineHandshakeStripped) {
+        try { clientSocket.write(chunk); } catch (_) {}
+        return;
       }
-      try { clientSocket.write(chunk); } catch (_) {}
+      // Accumulate until we see the end of the engine's HTTP headers.
+      engineStripBuf = Buffer.concat([engineStripBuf, chunk]);
+      const idx = engineStripBuf.indexOf("\r\n\r\n");
+      if (idx === -1) {
+        if (engineStripBuf.length > 16384) {
+          log("engine handshake response > 16KiB; bailing");
+          closeBoth();
+        }
+        return;
+      }
+      // Dump the response preamble for diagnostics. Should be
+      // "HTTP/1.1 101 Switching Protocols ..."; if it's anything
+      // else the engine refused our upgrade and we want to know why.
+      const headers = engineStripBuf.slice(0, idx).toString("utf8");
+      log("engine handshake response: " + headers.split("\r\n")[0]);
+      engineHandshakeStripped = true;
+      // Anything after \r\n\r\n is the first WS frame from the engine.
+      const tail = engineStripBuf.slice(idx + 4);
+      engineStripBuf = Buffer.alloc(0);
+      if (tail.length > 0) {
+        try { clientSocket.write(tail); } catch (_) {}
+      }
+      // Now flush buffered browser frames to the engine.
+      if (browserBuffer.length > 0) {
+        let total = 0;
+        for (const c of browserBuffer) total += c.length;
+        log("flushing " + browserBuffer.length + " buffered browser chunks (" + total + "B) to engine");
+        for (const c of browserBuffer) {
+          try { engineSocket.write(c); } catch (_) {}
+        }
+        browserBuffer = [];
+      }
     });
 
-    // Cleanup: either side disconnects closes the other.
     const closeBoth = () => {
       try { engineSocket.destroy(); } catch (_) {}
       try { clientSocket.destroy(); } catch (_) {}
     };
     clientSocket.on("close", (hadError) => {
-      log("clientSocket 'close' event (hadError=" + !!hadError +
-          " upgradeWritten=" + upgradeWritten + ")");
+      log("clientSocket 'close' (hadError=" + !!hadError + ")");
       closeBoth();
     });
     clientSocket.on("error", (e) => {
-      log("clientSocket 'error' event: " + e.message);
+      log("clientSocket 'error': " + e.message);
       closeBoth();
     });
-    clientSocket.on("end", () => {
-      log("clientSocket 'end' event");
-    });
     engineSocket.on("close", (hadError) => {
-      log("engineSocket 'close' event (hadError=" + !!hadError + ")");
+      log("engineSocket 'close' (hadError=" + !!hadError + ")");
       closeBoth();
     });
     engineSocket.on("error", (e) => {
-      log("engineSocket 'error' event: " + e.message);
-      if (clientSocket.writable && !engineConnected) {
-        try {
-          clientSocket.write(
-            "HTTP/1.1 502 Bad Gateway\r\n" +
-            "Content-Type: text/plain\r\n" +
-            "Connection: close\r\n" +
-            "\r\n" +
-            "RT engine unreachable: " + e.message
-          );
-        } catch (_) {}
-      }
+      log("engineSocket 'error': " + e.message);
       closeBoth();
-    });
-    engineSocket.on("end", () => {
-      log("engineSocket 'end' event");
     });
   });
 
-  // Return value retained for API symmetry with the old WebSocketServer
-  // version; nothing in server.js currently uses it, but if it ever
-  // does we can plumb something through here. Returning null is the
-  // clearest signal that this is no longer a ws.WebSocketServer.
   return null;
 }
