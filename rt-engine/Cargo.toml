@@ -11,7 +11,13 @@ repository = "https://github.com/9LiveZZZ-Git/gamma-compile-server"
 name = "gamma-rt-engine"
 path = "src/main.rs"
 
-# ── shared deps ──
+# Sprint 7.5.6.a part 1 -- minimal dep set. Just what's needed for
+# the capability probe + WebSocket handshake. Backend-specific deps
+# (ash, gpu-allocator, metal, objc2-*) land in part 2 when they're
+# actually used by code; pulling them in now slows the build with
+# zero benefit + risks version-pinning mistakes (which is what
+# caused the v0.1.0 first build to fail).
+
 [dependencies]
 # Async runtime: tokio for I/O multiplexing
 tokio = { version = "1.40", features = ["rt-multi-thread", "macros", "io-util", "io-std", "net", "sync", "time"] }
@@ -23,10 +29,10 @@ env_logger = "0.11"
 # CLI argument parsing
 clap = { version = "4.5", features = ["derive"] }
 
-# Math (matrices, vectors, quaternions)
+# Math (matrices, vectors, quaternions) -- used by scene.rs
 glam = { version = "0.29", features = ["bytemuck", "serde"] }
 
-# Safe POD casting for GPU buffers
+# Safe POD casting for GPU buffers -- used by scene.rs
 bytemuck = { version = "1.18", features = ["derive"] }
 
 # JSON scene-state serialization (control plane with the Node host)
@@ -38,29 +44,19 @@ serde_json = "1"
 tokio-tungstenite = "0.24"
 futures-util = "0.3"
 
-# Anyhow for ergonomic error propagation in the engine glue
+# Anyhow for ergonomic error propagation
 anyhow = "1"
-thiserror = "1"
 
-# ── PC backend (Vulkan + Vulkan-RT extensions) ──
-# Pulled on all platforms during dev; the binary just won't initialize
-# the Vulkan backend on a Mac (Metal path is preferred).
-[target.'cfg(any(target_os = "windows", target_os = "linux"))'.dependencies]
-ash = { version = "0.38", features = ["loaded", "debug"] }
-ash-window = "0.13"
-gpu-allocator = { version = "0.27", features = ["vulkan"], default-features = false }
-
-# ── Mac backend (Metal-RT via MPS) ──
-[target.'cfg(target_os = "macos")'.dependencies]
-metal = "0.29"
-objc2 = "0.5"
-objc2-foundation = "0.2"
-objc2-metal = "0.2"
-objc2-metal-performance-shaders = "0.2"
-core-graphics = "0.24"
-
-[features]
-default = []
-# Optional H.264 encoding via openh264. Disabled by default during
-# scaffolding -- ships when streaming work lands in §5.6.a part 2.
-# enable_h264 = ["dep:openh264"]
+# ── Deferred to §5.6.a part 2 (when actually used by code) ──
+#
+# [target.'cfg(any(target_os = "windows", target_os = "linux"))'.dependencies]
+# ash = { version = "0.38", features = ["loaded", "debug"] }
+# ash-window = "0.13"
+# gpu-allocator = { version = "0.27", features = ["vulkan"], default-features = false }
+#
+# [target.'cfg(target_os = "macos")'.dependencies]
+# metal = "0.29"
+# objc2 = "0.5"
+# objc2-foundation = "0.3"
+# objc2-metal = "0.3"
+# objc2-metal-performance-shaders = "0.3"
