@@ -47,16 +47,16 @@ futures-util = "0.3"
 # Anyhow for ergonomic error propagation
 anyhow = "1"
 
-# ── Deferred to §5.6.a part 2 (when actually used by code) ──
+# ── Mac probe (sprint 7.5.6.a part 2a) ──
+# Real MTLDevice queries replace the capability stub. Just `metal`
+# itself for now; objc2-* gets added back when we need MPS or
+# fine-grained Obj-C method access in §5.6.a part 2b (rendering).
+[target.'cfg(target_os = "macos")'.dependencies]
+metal = "0.29"
+
+# ── PC backend (deferred to §5.6.b when the Vulkan backend lands) ──
 #
 # [target.'cfg(any(target_os = "windows", target_os = "linux"))'.dependencies]
 # ash = { version = "0.38", features = ["loaded", "debug"] }
 # ash-window = "0.13"
 # gpu-allocator = { version = "0.27", features = ["vulkan"], default-features = false }
-#
-# [target.'cfg(target_os = "macos")'.dependencies]
-# metal = "0.29"
-# objc2 = "0.5"
-# objc2-foundation = "0.3"
-# objc2-metal = "0.3"
-# objc2-metal-performance-shaders = "0.3"

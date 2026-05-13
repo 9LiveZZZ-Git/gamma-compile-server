@@ -47,49 +47,60 @@ impl Capabilities {
     }
 }
 
-/// Probe the host. Stubs out the actual extension queries -- §5.6.a
-/// part 2 wires up real Vulkan / Metal device enumeration. For now
-/// this returns sane defaults based on the build target so the IPC
-/// handshake + Node-side integration can be exercised.
+/// Probe the host. Sprint 7.5.6.a part 2a wired up the Mac path
+/// (real MTLDevice + supportsRaytracing + Apple9 family check); the
+/// PC path is still stubbed pending the Vulkan backend landing in
+/// §5.6.b. Linux + Windows currently report vulkan_rt=true by
+/// assumption -- updated when ash is added back to Cargo.toml.
 pub fn probe() -> Capabilities {
     let os = std::env::consts::OS.to_string();
 
-    // §5.6.a part 2 will replace these stub values with real checks:
-    //   - Windows / Linux: try Entry::load() + check device features
-    //     for ray_tracing_pipeline + acceleration_structure
-    //   - macOS: MTLDevice + supportsRaytracing + supportsFamily
-    //     (Apple9 = M3+)
-    let (vulkan_rt, metal_present, metal_rt_hardware) = match os.as_str() {
-        "windows" | "linux" => (probe_vulkan_rt(), false, false),
-        "macos" => {
-            let (mp, mh) = probe_metal();
-            (false, mp, mh)
-        }
-        _ => (false, false, false),
+    let probe_result = match os.as_str() {
+        "windows" | "linux" => ProbeResult {
+            vulkan_rt: probe_vulkan_rt(),
+            metal_present: false,
+            metal_rt_hardware: false,
+            gpu_vendor: "unknown".to_string(),
+            gpu_name: "unknown (PC detection lands in §5.6.b)".to_string(),
+        },
+        "macos" => probe_metal(),
+        _ => ProbeResult {
+            vulkan_rt: false,
+            metal_present: false,
+            metal_rt_hardware: false,
+            gpu_vendor: "unknown".to_string(),
+            gpu_name: format!("unsupported os: {}", os),
+        },
     };
 
     Capabilities {
-        vulkan_rt,
-        metal_present,
-        metal_rt_hardware,
+        vulkan_rt: probe_result.vulkan_rt,
+        metal_present: probe_result.metal_present,
+        metal_rt_hardware: probe_result.metal_rt_hardware,
         compute_fallback: true, // any GPU can do this -- only really false on no-GPU CI runners
-        gpu_vendor: "unknown".to_string(),
-        gpu_name: "unknown (full detection lands in §5.6.a part 2)".to_string(),
+        gpu_vendor: probe_result.gpu_vendor,
+        gpu_name: probe_result.gpu_name,
         os,
     }
 }
 
+struct ProbeResult {
+    vulkan_rt: bool,
+    metal_present: bool,
+    metal_rt_hardware: bool,
+    gpu_vendor: String,
+    gpu_name: String,
+}
+
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 fn probe_vulkan_rt() -> bool {
-    // §5.6.a part 2: instance creation + physical device enumeration
+    // §5.6.b: instance creation + physical device enumeration
     // + extension property query for VK_KHR_ray_tracing_pipeline +
     // VK_KHR_acceleration_structure. Return true if any physical
     // device supports both.
     //
-    // Stub for part 1: assume available on Windows / Linux (the user
-    // will see runtime failures if not, which is fine for the
-    // scaffolding push).
-    log::debug!("probe_vulkan_rt: stub returning true (full detection in §5.6.a part 2)");
+    // Stub until the Vulkan backend lands.
+    log::debug!("probe_vulkan_rt: stub returning true (full detection in §5.6.b)");
     true
 }
 
@@ -99,19 +110,55 @@ fn probe_vulkan_rt() -> bool {
 }
 
 #[cfg(target_os = "macos")]
-fn probe_metal() -> (bool, bool) {
-    // §5.6.a part 2: MTLCreateSystemDefaultDevice + check
-    // supportsRaytracing + supportsFamily(MTLGPUFamilyApple9) for
-    // hardware RT (M3+) vs software (M1/M2).
-    //
-    // Stub for part 1: report present + hardware-RT true on macOS so
-    // the IPC handshake can be exercised. Dev machine is M4 so this
-    // is the realistic case.
-    log::debug!("probe_metal: stub returning (true, true) (full detection in §5.6.a part 2)");
-    (true, true)
+fn probe_metal() -> ProbeResult {
+    use metal::{Device, MTLGPUFamily};
+
+    let Some(device) = Device::system_default() else {
+        log::warn!("probe_metal: no Metal device found (very unusual on macOS)");
+        return ProbeResult {
+            vulkan_rt: false,
+            metal_present: false,
+            metal_rt_hardware: false,
+            gpu_vendor: "Apple".to_string(),
+            gpu_name: "no-Metal-device".to_string(),
+        };
+    };
+
+    let name = device.name().to_string();
+    let supports_rt = device.supports_raytracing();
+    // MTLGPUFamilyApple9 = M3 and later; the cutoff between software-
+    // emulated RT (MPSRayIntersector, on M1 / M2) and real hardware
+    // RT in the GPU cores. M1/M2 still have supports_raytracing ==
+    // true via MPS software traversal -- functional but classified
+    // "preview only" in the RT plan.
+    let apple9_plus = device.supports_family(MTLGPUFamily::Apple9);
+
+    log::info!(
+        "probe_metal: device={:?} supports_raytracing={} apple9+={}",
+        name, supports_rt, apple9_plus
+    );
+
+    ProbeResult {
+        vulkan_rt: false,
+        // metal_present = "we have a Metal device at all". Always
+        // true on macOS unless something is very wrong.
+        metal_present: true,
+        // metal_rt_hardware = "real hardware ray tracing in the
+        // GPU cores" (M3+). M1 / M2 report supports_rt=true but
+        // hardware_rt=false (software MPS path).
+        metal_rt_hardware: supports_rt && apple9_plus,
+        gpu_vendor: "Apple".to_string(),
+        gpu_name: name,
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
-fn probe_metal() -> (bool, bool) {
-    (false, false)
+fn probe_metal() -> ProbeResult {
+    ProbeResult {
+        vulkan_rt: false,
+        metal_present: false,
+        metal_rt_hardware: false,
+        gpu_vendor: "n/a".to_string(),
+        gpu_name: "n/a (not macOS)".to_string(),
+    }
 }
