@@ -30,6 +30,11 @@ export function attachRtProxy({
   const wss = new WebSocketServer({
     server: httpServer,
     path: "/rt",
+    // Disable per-message deflate on browser ↔ proxy too. Raw RGBA
+    // pixel data is essentially incompressible (already noise-like
+    // for ray-traced scenes); deflate would burn CPU for ~0% gain
+    // and adds a CPU hop on every 1.9 MB frame.
+    perMessageDeflate: false,
     verifyClient: (info, cb) => {
       // Same origin policy as the OSC bridge -- GH Pages + localhost
       // dev ports allowed by default.
@@ -48,7 +53,17 @@ export function attachRtProxy({
 
     let engineWs;
     try {
-      engineWs = new WebSocket("ws://" + engineHost + ":" + enginePort + "/");
+      // perMessageDeflate: false -- Node `ws` defaults to negotiating
+      // permessage-deflate with `client_max_window_bits` (no value)
+      // in the upgrade request. Some versions of tokio-tungstenite
+      // (Rust engine side) parse that as a malformed extension header
+      // and reject the handshake outright. We don't need compression
+      // for loopback traffic anyway; raw RGBA at 30fps is ~57 Mbps
+      // which fits in a Unix socket no problem. Same flag also passed
+      // to the WebSocketServer above so the browser ↔ proxy hop
+      // doesn't waste cycles re-deflating either.
+      engineWs = new WebSocket("ws://" + engineHost + ":" + enginePort + "/",
+                                { perMessageDeflate: false });
     } catch (e) {
       logger.warn("[rt-proxy] could not open engine WS: " + e.message);
       _sendErr(clientWs, "proxy-init", e.message);

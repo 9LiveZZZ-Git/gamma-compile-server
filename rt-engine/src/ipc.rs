@@ -90,7 +90,12 @@ pub async fn serve(
         tokio::spawn(async move {
             info!("client connected: {}", peer);
             if let Err(e) = handle_connection(stream, caps, backend_str).await {
-                warn!("client {} handler error: {}", peer, e);
+                // {:#} dumps the full anyhow cause chain rather than
+                // just the outermost wrapper. Critical for diagnosing
+                // "ws handshake failed" -- the wrapper is useless on
+                // its own; we need the underlying tungstenite::Error
+                // to know which header / state the parser tripped on.
+                warn!("client {} handler error: {:#}", peer, e);
             }
             info!("client {} disconnected", peer);
         });
