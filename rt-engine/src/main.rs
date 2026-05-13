@@ -23,6 +23,7 @@ use log::{info, warn};
 mod backend;
 mod capability;
 mod ipc;
+mod render;
 mod scene;
 
 #[derive(Parser, Debug)]
@@ -52,6 +53,25 @@ struct Cli {
     /// Default `auto` picks the best one available on this machine.
     #[arg(long, default_value = "auto")]
     backend: String,
+
+    /// One-shot test render: build a single triangle, intersect per
+    /// pixel via Möller-Trumbore in a Metal compute kernel, save the
+    /// result to the path specified by --output, exit. Validates the
+    /// full Metal pipeline before any streaming / WebSocket work.
+    #[arg(long, default_value_t = false)]
+    render_test: bool,
+
+    /// Output PNG path for --render-test.
+    #[arg(long, default_value = "triangle.png")]
+    output: String,
+
+    /// Render-test image width.
+    #[arg(long, default_value_t = 800)]
+    width: u32,
+
+    /// Render-test image height.
+    #[arg(long, default_value_t = 600)]
+    height: u32,
 }
 
 #[tokio::main]
@@ -69,6 +89,17 @@ async fn main() -> anyhow::Result<()> {
         let caps = capability::probe();
         println!("{}", serde_json::to_string_pretty(&caps)?);
         return Ok(());
+    }
+
+    // Render-test mode: one-shot test render to a PNG, exit. The
+    // smallest end-to-end Metal validation -- no streaming, no
+    // scene serialization, just "does the binary produce pixels?".
+    if cli.render_test {
+        info!(
+            "running --render-test: {}x{} → {}",
+            cli.width, cli.height, cli.output
+        );
+        return render::render_test_triangle(cli.width, cli.height, &cli.output);
     }
 
     info!(

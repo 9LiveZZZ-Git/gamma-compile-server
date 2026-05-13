@@ -47,6 +47,11 @@ futures-util = "0.3"
 # Anyhow for ergonomic error propagation
 anyhow = "1"
 
+# Image I/O for the `--render-test` PNG output path. PNG-only to
+# keep the dep tree small; other formats land when we need them
+# (e.g. EXR for HDR output, BMP for fastest write).
+image = { version = "0.25", default-features = false, features = ["png"] }
+
 # ── Mac probe (sprint 7.5.6.a part 2a) ──
 # Real MTLDevice queries replace the capability stub. Just `metal`
 # itself for now; objc2-* gets added back when we need MPS or
