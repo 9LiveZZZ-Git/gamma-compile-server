@@ -70,18 +70,41 @@ export function attachRtProxy({
     }
 
     const peer = clientSocket.remoteAddress + ":" + clientSocket.remotePort;
-    logger.log("[rt-proxy] client " + peer + " upgrading; TCP forward → " +
-               engineHost + ":" + enginePort);
+    const t0 = Date.now();
+    const log = (msg) => logger.log("[rt-proxy] +" + (Date.now() - t0) + "ms " + peer + " " + msg);
+    log("upgrading; TCP forward → " + engineHost + ":" + enginePort);
 
     // Open raw TCP to the engine.
     const engineSocket = net.connect({ host: engineHost, port: enginePort });
 
     let engineConnected = false;
+    let upgradeWritten = false;
     let buffered = [];  // bytes from client we received before engine TCP opens
+
+    // ── Build the upgrade request EARLY (in this synchronous tick) so
+    // we don't depend on `req` still being valid when 'connect' fires
+    // later. Logging its size + first line confirms what we're going
+    // to forward.
+    let upgradeRequest = "GET " + req.url + " HTTP/" + req.httpVersion + "\r\n";
+    for (const [key, value] of Object.entries(req.headers)) {
+      if (Array.isArray(value)) {
+        for (const v of value) upgradeRequest += key + ": " + v + "\r\n";
+      } else {
+        upgradeRequest += key + ": " + value + "\r\n";
+      }
+    }
+    upgradeRequest += "\r\n";
+    log("constructed upgrade request (" + upgradeRequest.length + " bytes):");
+    // Dump the raw request so we can see EXACTLY what tungstenite sees.
+    // Indent each line so it's distinguishable in the log.
+    for (const line of upgradeRequest.split("\r\n")) {
+      if (line) logger.log("[rt-proxy]   | " + line);
+    }
 
     // Client → engine. Until engineSocket is connected, buffer the
     // bytes. After connect, write them then pipe directly.
     clientSocket.on("data", (chunk) => {
+      log("client→ " + chunk.length + "B (engineConnected=" + engineConnected + ")");
       if (engineConnected) {
         engineSocket.write(chunk);
       } else {
@@ -90,30 +113,27 @@ export function attachRtProxy({
     });
 
     engineSocket.on("connect", () => {
-      engineConnected = true;
-      // Replay the original HTTP upgrade request so the engine's
-      // tokio-tungstenite handshake sees the browser's exact headers.
-      // This makes the engine's WS handshake be with the BROWSER, not
-      // the proxy. Same Sec-WebSocket-Key, same Origin, same
-      // extensions offered -- the engine's response goes straight
-      // back to the browser through the pipe.
-      let upgradeRequest = "GET " + req.url + " HTTP/" + req.httpVersion + "\r\n";
-      for (const [key, value] of Object.entries(req.headers)) {
-        if (Array.isArray(value)) {
-          for (const v of value) upgradeRequest += key + ": " + v + "\r\n";
-        } else {
-          upgradeRequest += key + ": " + value + "\r\n";
+      log("engineSocket 'connect' event");
+      try {
+        engineConnected = true;
+        log("writing " + upgradeRequest.length + "B upgrade request to engine");
+        engineSocket.write(upgradeRequest);
+        upgradeWritten = true;
+        if (head && head.length) {
+          log("writing " + head.length + "B head bytes to engine");
+          engineSocket.write(head);
         }
+        if (buffered.length) {
+          let total = 0;
+          for (const chunk of buffered) total += chunk.length;
+          log("flushing " + buffered.length + " buffered chunks (" + total + "B) to engine");
+          for (const chunk of buffered) engineSocket.write(chunk);
+          buffered = [];
+        }
+      } catch (e) {
+        logger.error("[rt-proxy] +" + (Date.now() - t0) + "ms " + peer +
+                     " THREW in connect handler: " + e.message + "\n" + e.stack);
       }
-      upgradeRequest += "\r\n";
-      engineSocket.write(upgradeRequest);
-      // `head` is any bytes received after the headers but before the
-      // upgrade event fired (rare, but possible if client pipelines).
-      if (head && head.length) engineSocket.write(head);
-      // Flush anything the client sent while we were connecting.
-      for (const chunk of buffered) engineSocket.write(chunk);
-      buffered = [];
-      logger.log("[rt-proxy] engine connected for " + peer);
     });
 
     // Engine → client: straight pipe. The first bytes will be the
@@ -121,6 +141,16 @@ export function attachRtProxy({
     // the browser consumes to complete its handshake. After that:
     // WS frames in both directions, opaque to us.
     engineSocket.on("data", (chunk) => {
+      log("engine→ " + chunk.length + "B");
+      // First chunk is the HTTP response -- dump its preamble so we
+      // can see the engine's 101 response (or whatever error it
+      // wrote instead).
+      if (chunk.length > 0 && chunk.length < 4096) {
+        try {
+          const preview = chunk.toString("utf8").split("\r\n").slice(0, 8).join(" | ");
+          log("engine response preamble: " + preview.slice(0, 400));
+        } catch (_) {}
+      }
       try { clientSocket.write(chunk); } catch (_) {}
     });
 
@@ -129,27 +159,24 @@ export function attachRtProxy({
       try { engineSocket.destroy(); } catch (_) {}
       try { clientSocket.destroy(); } catch (_) {}
     };
-    clientSocket.on("close", () => {
-      logger.log("[rt-proxy] client " + peer + " disconnected");
+    clientSocket.on("close", (hadError) => {
+      log("clientSocket 'close' event (hadError=" + !!hadError +
+          " upgradeWritten=" + upgradeWritten + ")");
       closeBoth();
     });
     clientSocket.on("error", (e) => {
-      logger.warn("[rt-proxy] client " + peer + " socket error: " + e.message);
+      log("clientSocket 'error' event: " + e.message);
       closeBoth();
     });
-    engineSocket.on("close", () => {
-      logger.log("[rt-proxy] engine disconnected for " + peer);
+    clientSocket.on("end", () => {
+      log("clientSocket 'end' event");
+    });
+    engineSocket.on("close", (hadError) => {
+      log("engineSocket 'close' event (hadError=" + !!hadError + ")");
       closeBoth();
     });
     engineSocket.on("error", (e) => {
-      logger.warn("[rt-proxy] engine TCP error for " + peer + ": " + e.message +
-        " — is the rt-engine running on " + engineHost + ":" + enginePort + "?");
-      // Write a 502-equivalent before the upgrade response, if we
-      // haven't already written anything to the client. Best-effort:
-      // if the client side hasn't received an HTTP response yet,
-      // they'll see a connection failure; otherwise they'll see a
-      // mid-stream TCP close which the browser will surface as a
-      // WS-level error.
+      log("engineSocket 'error' event: " + e.message);
       if (clientSocket.writable && !engineConnected) {
         try {
           clientSocket.write(
@@ -162,6 +189,9 @@ export function attachRtProxy({
         } catch (_) {}
       }
       closeBoth();
+    });
+    engineSocket.on("end", () => {
+      log("engineSocket 'end' event");
     });
   });
 
