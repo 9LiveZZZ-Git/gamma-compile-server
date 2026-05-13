@@ -12,6 +12,7 @@ import { dirname, join } from "node:path";
 import { compile } from "./compile.js";
 import { startOscBridge } from "./osc-bridge.js";
 import { probeEngine } from "./rt-engine-host.js";
+import { attachRtProxy } from "./rt-proxy.js";
 
 // Read package version once at startup so /health reports the actual
 // running version. Better than hardcoding a string that drifts on bumps.
@@ -108,15 +109,17 @@ export async function startServer({
       // Sprint 7.5.6.a part 1 -- RT engine availability. The
       // editor's RayTracedScene node reads this to decide whether
       // to offer RT rendering or fall back to raster Scene.
+      // proxyReady flipped true in part 2d -- the /rt WebSocket
+      // proxy is now attached + can forward to the engine. (User
+      // still has to start the engine binary manually for now;
+      // auto-spawn is a follow-up.)
       rtEngine: rtEngineInfo
         ? { available: true,
             capabilities: rtEngineInfo.capabilities,
             wsPath: "/rt",
-            // The /rt proxy itself lands in §5.6.a part 2; for now
-            // the editor knows the engine EXISTS but rendering
-            // requests will fail until the proxy is built.
-            proxyReady: false }
-        : { available: false }
+            proxyReady: true,
+            enginePort: 9100 }
+        : { available: false, proxyReady: true, enginePort: 9100 }
     });
   });
 
@@ -167,6 +170,28 @@ export async function startServer({
     console.log(fmtLine("Click ▶. The editor auto-detects this daemon and"));
     console.log(fmtLine("routes compile requests here."));
     console.log(fmtLine(""));
+
+    // Sprint 7.5.6.a part 2d -- /rt WebSocket proxy. Forwards browser
+    // editor traffic to the gamma-rt-engine running on its own local
+    // port (9100 default). User must start the engine manually for
+    // now; the proxy reports a clean error to the editor if the
+    // engine isn't reachable. Same origin policy as the OSC bridge.
+    try {
+      attachRtProxy({
+        httpServer,
+        engineHost: "127.0.0.1",
+        enginePort: 9100,
+        allowedOrigins,
+        allowAnyOrigin: allowAny
+      });
+      console.log(fmtLine("RT engine proxy:"));
+      console.log(fmtLine("  ws:    ws://" + displayHost + ":" + port + "/rt"));
+      console.log(fmtLine("  → engine at ws://127.0.0.1:9100/"));
+      console.log(fmtLine(""));
+    } catch (e) {
+      console.log(fmtLine("⚠ RT proxy attach failed: " + (e && e.message || e)));
+      console.log(fmtLine(""));
+    }
 
     // OSC bridge — UDP listener + WebSocket fan-out. Same host as the
     // HTTP server; WS upgrade attaches to the already-listening
