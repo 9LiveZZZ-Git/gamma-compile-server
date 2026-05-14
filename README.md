@@ -6,6 +6,8 @@ A tiny local Emscripten compile daemon for the [Gamma Node Editor](https://9live
 
 **What it ships:** real Emscripten + the actual Gamma source. The wasm output is byte-identical-ish to what AlloLib Studio Online produces — full production fidelity.
 
+**Plus, optionally:** a sibling **`gamma-rt-engine`** binary in `rt-engine/` (Rust + Metal-RT) that powers the editor's `RayTracedScene` node — hardware-accelerated path tracing with MetalFX denoise + upscale, streamed back to the editor over a separate WebSocket. Opt-in; the daemon spawns it on demand when the editor probes `/health` and the binary is present. M-series Macs only for now; Vulkan-RT for PC GPUs is in the roadmap. See "Hardware ray tracing" below.
+
 ## Quick start
 
 Requires **Node 20+** and **git** on your PATH.
@@ -79,6 +81,102 @@ tablet on the same network:
 Replace `192.168.1.42` with your host's actual LAN IP. The daemon's
 startup banner shows when it's bound to all interfaces.
 
+## Hardware ray tracing (optional)
+
+The `rt-engine/` sibling directory ships a separate Rust binary —
+`gamma-rt-engine` — that handles the editor's `RayTracedScene` node.
+True path tracing (glass, mirrors, area lights with soft shadows,
+multi-bounce GI), denoised + upscaled by Apple's
+`MTLFXTemporalDenoisedScaler`. Independent from the audio compile
+path; you can run one without the other.
+
+**Hardware support (current):**
+
+| GPU                 | RT path                                                  | Status                                     |
+|---------------------|----------------------------------------------------------|--------------------------------------------|
+| Apple M3 / M4 / M5  | Metal-RT hardware traversal + MetalFX denoise+upscale    | Production-grade, 60 fps at `preview` 720p |
+| Apple M1 / M2       | Metal-RT software traversal (MPS) + MetalFX              | Preview-quality at `draft` preset only     |
+| Everything else     | RT node falls back to raster `Scene` in the editor       | Engine doesn't run                         |
+
+PC Vulkan-RT (NVIDIA / AMD / Intel Arc) is on the roadmap but not
+yet shipped — track `gamma-compile-server`'s `rt-engine/` sources
+and the editor's `docs/RAYTRACING.md` phase plan.
+
+### Building the engine
+
+Requires **Rust 1.78+** and **Xcode Command Line Tools** (for the
+Metal SDK headers).
+
+```bash
+cargo build --release --manifest-path rt-engine/Cargo.toml
+```
+
+The build embeds the Metal kernel (`triangle.metal`) via
+`include_str!`, so any shader change requires a `cargo build`. The
+binary lands at `rt-engine/target/release/gamma-rt-engine`.
+
+### Running the engine
+
+Two patterns work:
+
+**A) Auto-spawn (simplest).** Just start the compile daemon — it
+probes for the engine binary at the path above and spawns it as a
+child process on first `/health` probe from the editor. Engine
+lifetime = daemon lifetime. Logs come out mixed with the daemon's.
+
+```bash
+node bin/gamma-compile-server.js
+# (or `npx @9livezzz/gamma-compile-server` once published)
+```
+
+**B) Run separately (better for iterating on engine code).** Start
+the engine in its own terminal so its logs are clean; the daemon
+detects port 9100 already in use and uses the existing instance.
+You can Ctrl-C + restart the engine without touching the daemon.
+
+```bash
+# Terminal 1: engine
+cargo run --release --manifest-path rt-engine/Cargo.toml
+
+# Terminal 2: daemon
+node bin/gamma-compile-server.js
+```
+
+Engine listens on `ws://127.0.0.1:9100/`. The editor probes
+`/health` on the daemon (port 8765) to discover the engine's port,
+then connects **directly** to the engine WebSocket. The daemon
+isn't in the per-frame RT path at all — it only does the initial
+spawn + capability advertisement.
+
+> ⚠ **After a `cargo build` you must restart the engine process.**
+> The daemon has no way to know your binary on disk is newer than
+> the running process, so if you forget this step the daemon's
+> "port already in use; assuming external instance" log line is
+> the symptom — kill the orphan (`pkill gamma-rt-engine` or
+> `lsof -ti :9100 | xargs kill`) and start the new binary.
+
+### What the editor sees
+
+The editor's `RayTracedScene` node has the same input shape as the
+raster `Scene` (4 meshes / camera / 4 lights / clear color) plus
+quality knobs: `quality` preset (draft / preview / final → 1/4/16
+spp + 2/4/8 bounces), `displaySize` (480p–1080p), and `renderScale`
+(native / quality / balanced / performance / ultra — DLSS/FSR
+convention; the kernel shades at that fraction and MetalFX upscales
+to display dims). When the engine is unreachable, the node renders
+status-coded fallback colors so the user knows what's wrong without
+opening dev tools — see the editor's README "Hardware ray tracing"
+section for the color key.
+
+### Engine-side state
+
+Each connected editor session gets its own `MetalRenderer` with
+private G-buffer textures, TDS scaler, and acceleration structure.
+The renderer is rebuilt on `configure` (dims / scale change) or
+on dropped WS. Path-tracing accumulation resets on any scene,
+camera, light, material, or quality change so TDS history doesn't
+mix pre-/post-change samples.
+
 ## How the editor finds it
 
 On first Play click, the editor does:
@@ -112,8 +210,10 @@ To wipe and re-download: delete the cache directory and re-run.
 `src/compile.js` wraps `em++`. On first request it builds `libgamma.a` from the 11 web-buildable Gamma sources (same set AlloLib Studio Online uses). Subsequent requests link the new patch against the cached library — quick.
 
 `src/server.js` is an Express app with two routes:
-- `GET /health` — liveness probe + version + toolchain paths
+- `GET /health` — liveness probe + version + toolchain paths + RT engine port advertisement (if running).
 - `POST /compile` — body `{ wrappedSrc, optLevel }`, returns `application/wasm` bytes plus stderr in headers, or JSON error with stderr inline.
+
+`rt-engine/` is the optional native ray-tracer (Rust + Metal-RT). The daemon spawns it on demand and surfaces its port in `/health` so the editor can connect directly. Engine sources live under `rt-engine/src/`; the entry point is `rt-engine/src/main.rs`.
 
 CORS allows the editor's origin (`9livezzz-git.github.io`) plus common localhost ports for local development.
 
@@ -126,6 +226,10 @@ CORS allows the editor's origin (`9livezzz-git.github.io`) plus common localhost
 **emsdk install fails on Windows with permission errors** — run the terminal as Administrator just for the first run. Subsequent starts don't need admin.
 
 **Editor says "local-cli detected" but compiles fail** — check the daemon's terminal output; emcc errors are printed inline.
+
+**RT engine startup says "port 9100 already in use; assuming external instance"** — there's an orphaned `gamma-rt-engine` from a previous run. Kill it (`pkill gamma-rt-engine` or `lsof -ti :9100 | xargs kill` on macOS) and restart the daemon so it spawns the freshly-built binary.
+
+**`RayTracedScene` node viewport is solid red / crimson / amber** — engine-side problem. See the editor's README "Troubleshooting" subsection of "Hardware ray tracing" — each color maps to a specific failure mode.
 
 ## License
 
