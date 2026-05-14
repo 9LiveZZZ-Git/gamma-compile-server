@@ -43,21 +43,34 @@ struct CameraUniform {
     misc: [f32; 4],    // .x = tan(fov/2), .y = aspect, .zw = unused
 }
 
-/// Per-mesh (= per-geometry-in-the-AS) color buffer entry.
+/// Per-mesh material uniform. Matches MSL MaterialUniform layout.
+/// Single struct discriminated by `flags.x` so the kernel can `switch`
+/// on the material type (0=Unlit, 1=Phong, 2=PBR).
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
-struct PrimitiveColor {
-    color: [f32; 4], // .xyz = RGB, .w = unused
+struct MaterialUniform {
+    /// .xyz = base color (albedo), .w = vertex_mix [0..1]
+    albedo: [f32; 4],
+    /// .x = metallic, .y = roughness, .z = shininess, .w = ambient
+    params: [f32; 4],
+    /// .x = material type tag (0=Unlit, 1=Phong, 2=PBR)
+    flags: [u32; 4],
 }
 
-/// Per-geometry offset into the global per-primitive normals buffer.
-/// The kernel does `flat_normals[geom_offsets[geom_id].triangle_offset
-/// + primitive_id]` to fetch the hit triangle's flat normal.
+/// Per-geometry offset table. For c-2 smooth shading the kernel
+/// needs to fetch the three per-vertex normals of the hit triangle
+/// from the global concatenated buffers, so we track both the
+/// vertex_offset (into vertex_normals) and the index_offset (into
+/// vertex_indices, for meshes built with indices). Meshes without
+/// indices (raw 3-vertex-per-triangle layout) signal that with
+/// `is_indexed == 0` and use direct vertex_offset + primitive*3.
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
 struct GeomOffset {
-    triangle_offset: u32, // index into flat_normals[] for this geometry's first triangle
-    _pad: [u32; 3],       // 16-byte alignment for the buffer
+    vertex_offset: u32, // into vertex_normals[]
+    index_offset: u32,  // into vertex_indices[]
+    is_indexed: u32,    // 0 or 1
+    _pad: u32,          // 16-byte total
 }
 
 /// Lights uniform layout matching MSL LightsUniform. Up to 4
@@ -77,14 +90,20 @@ struct LightsUniform {
 }
 
 /// Per-mesh build output returned by `build_mesh_buffers`. Holds the
-/// GPU buffers the AS needs (positions + optional indices) AND the
-/// CPU-side flat-normals vector that we'll concatenate into the
-/// global normals buffer used by the kernel for Lambert shading.
+/// GPU buffers the AS needs (positions + optional indices) AND
+/// CPU-side per-vertex data (normals + a copy of indices) that gets
+/// concatenated into global kernel-side buffers in update_scene.
 struct MeshBuildResult {
     position_buffer: Buffer,
     index_buffer: Option<Buffer>,
     triangle_count: u32,
-    flat_normals: Vec<[f32; 4]>, // one entry per triangle, .xyz = normal
+    /// Per-vertex normals (one entry per vertex, .xyz = normal).
+    vertex_normals: Vec<[f32; 4]>,
+    /// Copy of the indices for kernel-side smooth-normal lookup.
+    /// Empty for non-indexed meshes (kernel uses primitive*3 + i).
+    indices_for_kernel: Vec<u32>,
+    /// Number of vertices in this mesh (= vertex_normals.len()).
+    vertex_count: u32,
 }
 
 /// Reusable Metal renderer with hardware RT. Output texture size is
@@ -101,9 +120,10 @@ pub struct MetalRenderer {
     // Scene state -- None until the IPC layer pushes a Scene message.
     accel: Option<AccelerationStructure>,
     camera_buffer: Option<Buffer>,
-    primitive_color_buffer: Option<Buffer>,
-    flat_normals_buffer: Option<Buffer>,   // global per-triangle flat normals
-    geom_offsets_buffer: Option<Buffer>,   // geom_id → first-triangle index
+    material_buffer: Option<Buffer>,       // per-mesh MaterialUniform[]
+    vertex_normals_buffer: Option<Buffer>, // global per-vertex normals (smooth shading)
+    vertex_indices_buffer: Option<Buffer>, // global indices for kernel-side lookup
+    geom_offsets_buffer: Option<Buffer>,   // per-mesh GeomOffset[]
     lights_buffer: Option<Buffer>,
     // Vertex / index buffers we built for the current AS. Must
     // outlive the AS (Metal's BVH stores GPU pointers into them).
@@ -156,8 +176,9 @@ impl MetalRenderer {
             height,
             accel: None,
             camera_buffer: None,
-            primitive_color_buffer: None,
-            flat_normals_buffer: None,
+            material_buffer: None,
+            vertex_normals_buffer: None,
+            vertex_indices_buffer: None,
             geom_offsets_buffer: None,
             lights_buffer: None,
             _scene_buffers: Vec::new(),
@@ -183,8 +204,9 @@ impl MetalRenderer {
             // clear-color CPU return below.
             self.accel = None;
             self.camera_buffer = None;
-            self.primitive_color_buffer = None;
-            self.flat_normals_buffer = None;
+            self.material_buffer = None;
+            self.vertex_normals_buffer = None;
+            self.vertex_indices_buffer = None;
             self.geom_offsets_buffer = None;
             self.lights_buffer = None;
             self._scene_buffers.clear();
@@ -194,29 +216,30 @@ impl MetalRenderer {
 
         // Build per-mesh GPU resources. Pre-transform vertices on the
         // CPU (option-a simplicity; instance AS with per-instance
-        // transforms lands in 2e-2).
+        // transforms lands in 2e-2). Accumulate smooth-shading data
+        // into global buffers indexed by GeomOffset[geometry_id].
         let mut scene_buffers: Vec<Buffer> = Vec::new();
         let mut geom_descs_owned: Vec<AccelerationStructureTriangleGeometryDescriptor> =
             Vec::with_capacity(scene.meshes.len());
-        let mut primitive_colors: Vec<PrimitiveColor> = Vec::with_capacity(scene.meshes.len());
+        let mut materials: Vec<MaterialUniform> = Vec::with_capacity(scene.meshes.len());
         let mut geom_offsets: Vec<GeomOffset> = Vec::with_capacity(scene.meshes.len());
-        // Global per-triangle flat-normal buffer concatenated across
-        // all meshes; geom_offsets[gid].triangle_offset tells the
-        // kernel where this geometry's triangles begin.
-        let mut global_flat_normals: Vec<[f32; 4]> = Vec::new();
+        let mut global_vertex_normals: Vec<[f32; 4]> = Vec::new();
+        let mut global_vertex_indices: Vec<u32> = Vec::new();
         let mut total_triangles: u64 = 0;
 
         for mesh in &scene.meshes {
             let built = self.build_mesh_buffers(mesh)?;
             total_triangles += built.triangle_count as u64;
 
-            // Record where this geometry's triangles start in the
-            // global normals buffer BEFORE pushing them.
+            // Record this geometry's offsets BEFORE appending its data.
             geom_offsets.push(GeomOffset {
-                triangle_offset: global_flat_normals.len() as u32,
-                _pad: [0; 3],
+                vertex_offset: global_vertex_normals.len() as u32,
+                index_offset: global_vertex_indices.len() as u32,
+                is_indexed: if built.indices_for_kernel.is_empty() { 0 } else { 1 },
+                _pad: 0,
             });
-            global_flat_normals.extend_from_slice(&built.flat_normals);
+            global_vertex_normals.extend_from_slice(&built.vertex_normals);
+            global_vertex_indices.extend_from_slice(&built.indices_for_kernel);
 
             let gd = AccelerationStructureTriangleGeometryDescriptor::descriptor();
             gd.set_vertex_buffer(Some(&built.position_buffer));
@@ -236,20 +259,9 @@ impl MetalRenderer {
                 scene_buffers.push(idx_buf);
             }
 
-            // Per-mesh color from the material. Option (a) only uses
-            // the .color (or .tint for Mirror); everything else
-            // collapses to a flat RGB for now.
-            let color = match &mesh.material {
-                Material::Unlit { color, .. } => *color,
-                Material::Phong { color, .. } => *color,
-                Material::Pbr { color, .. } => *color,
-                Material::Glass { color, .. } => *color,
-                Material::Mirror { tint } => *tint,
-                Material::Shader { color, .. } => *color,
-            };
-            primitive_colors.push(PrimitiveColor {
-                color: [color[0], color[1], color[2], 1.0],
-            });
+            // Per-mesh material → MaterialUniform. The discriminator
+            // tag (.flags.x) tells the kernel which BRDF to evaluate.
+            materials.push(material_to_uniform(&mesh.material));
         }
 
         // Upcast each Triangle descriptor to base Geometry for the
@@ -295,19 +307,36 @@ impl MetalRenderer {
             total_triangles
         );
 
-        // Global flat-normals buffer (one float4 per triangle across
-        // all meshes). Indexed by `geom_offsets[geom_id].triangle_offset
-        // + primitive_id` in the kernel.
-        let flat_norm_buf = self.device.new_buffer_with_data(
-            global_flat_normals.as_ptr() as *const c_void,
-            (global_flat_normals.len().max(1) * std::mem::size_of::<[f32; 4]>()) as u64,
+        // Global per-vertex normals buffer (one float4 per vertex,
+        // concatenated across all meshes). Indexed by
+        // `geom_offsets[gid].vertex_offset + local_vertex_id`.
+        let vnorm_buf = self.device.new_buffer_with_data(
+            global_vertex_normals.as_ptr() as *const c_void,
+            (global_vertex_normals.len().max(1) * std::mem::size_of::<[f32; 4]>()) as u64,
             MTLResourceOptions::StorageModeShared,
         );
+
+        // Global indices buffer for kernel-side smooth-normal lookup.
+        // Empty for fully non-indexed scenes (we still allocate a
+        // 1-element dummy buffer because Metal's set_buffer doesn't
+        // accept zero-length).
+        let vidx_buf = if global_vertex_indices.is_empty() {
+            self.device.new_buffer(
+                4,
+                MTLResourceOptions::StorageModeShared,
+            )
+        } else {
+            self.device.new_buffer_with_data(
+                global_vertex_indices.as_ptr() as *const c_void,
+                (global_vertex_indices.len() * std::mem::size_of::<u32>()) as u64,
+                MTLResourceOptions::StorageModeShared,
+            )
+        };
 
         // Per-geometry offset table.
         let geom_off_buf = self.device.new_buffer_with_data(
             geom_offsets.as_ptr() as *const c_void,
-            (geom_offsets.len().max(1) * std::mem::size_of::<GeomOffset>()) as u64,
+            (geom_offsets.len() * std::mem::size_of::<GeomOffset>()) as u64,
             MTLResourceOptions::StorageModeShared,
         );
 
@@ -332,17 +361,18 @@ impl MetalRenderer {
             MTLResourceOptions::StorageModeShared,
         );
 
-        // Per-mesh color buffer.
-        let color_buf = self.device.new_buffer_with_data(
-            primitive_colors.as_ptr() as *const c_void,
-            (primitive_colors.len() * std::mem::size_of::<PrimitiveColor>()) as u64,
+        // Per-mesh material buffer.
+        let mat_buf = self.device.new_buffer_with_data(
+            materials.as_ptr() as *const c_void,
+            (materials.len() * std::mem::size_of::<MaterialUniform>()) as u64,
             MTLResourceOptions::StorageModeShared,
         );
 
         self.accel = Some(accel);
         self.camera_buffer = Some(cam_buf);
-        self.primitive_color_buffer = Some(color_buf);
-        self.flat_normals_buffer = Some(flat_norm_buf);
+        self.material_buffer = Some(mat_buf);
+        self.vertex_normals_buffer = Some(vnorm_buf);
+        self.vertex_indices_buffer = Some(vidx_buf);
         self.geom_offsets_buffer = Some(geom_off_buf);
         self.lights_buffer = Some(lights_buf);
         self._scene_buffers = scene_buffers;
@@ -389,12 +419,43 @@ impl MetalRenderer {
         Ok(())
     }
 
-    /// Build vertex + index buffers for one mesh. Extracts pos.xyz
-    /// from the stride-N interleaved input (editor sends stride=11:
-    /// pos.xyz + color.rgb + normal.xyz + uv.xy) and pre-transforms
-    /// by the mesh's column-major 4×4 transform. ALSO computes a flat
-    /// per-triangle normal from the transformed vertices -- the
-    /// kernel uses these for Lambert shading.
+    /// Update just the per-mesh material array (cheap; no AS rebuild).
+    /// Used by Params for live-dragging PhongMat.shininess /
+    /// PhysicalMat.metallic / etc. Caller must supply a slice of
+    /// the same length the current AS was built from; mismatched
+    /// length means the mesh set changed and we should be doing a
+    /// full update_scene instead (caller decides via signature).
+    pub fn update_materials(&mut self, materials: &[Material]) -> anyhow::Result<()> {
+        let Some(buf) = self.material_buffer.as_ref() else {
+            return Err(anyhow!("material buffer not yet allocated"));
+        };
+        let buffer_count = (buf.length() as usize) / std::mem::size_of::<MaterialUniform>();
+        if buffer_count != materials.len() {
+            return Err(anyhow!(
+                "material count mismatch: scene has {} mesh(es) but Params sent {} material(s)",
+                buffer_count,
+                materials.len()
+            ));
+        }
+        let ptr = buf.contents() as *mut MaterialUniform;
+        for (i, m) in materials.iter().enumerate() {
+            unsafe { ptr.add(i).write(material_to_uniform(m)); }
+        }
+        Ok(())
+    }
+
+    /// Build per-mesh GPU resources + CPU-side smooth-shading data.
+    /// Stride-11 editor vertex layout: pos.xyz + color.rgb + normal.xyz
+    /// + uv.xy. We extract pos.xyz (transformed by mesh.transform) for
+    /// the AS, and normal.xyz (rotated by the upper-3×3 of the
+    /// transform) for kernel-side smooth shading. Indices are copied
+    /// for the kernel to use in barycentric vertex lookup.
+    ///
+    /// Normal transform note: for identity / rotation / uniform-scale
+    /// transforms the upper-3×3 of M correctly rotates normals (after
+    /// re-normalizing). Non-uniform scale requires the inverse-
+    /// transpose; we don't support non-uniform mesh transforms in
+    /// 2e-1 / c-2, so the cheap upper-3×3 path is fine.
     fn build_mesh_buffers(
         &self,
         mesh: &MeshInstance,
@@ -411,16 +472,16 @@ impl MetalRenderer {
         };
 
         let stride_f = stride as usize;
-        if stride_f < 3 || vertices.len() % stride_f != 0 {
+        if stride_f < 9 || vertices.len() % stride_f != 0 {
             return Err(anyhow!(
-                "invalid vertex stride {} for {} floats",
+                "invalid vertex stride {} for {} floats (need >= 9: pos.xyz + color.rgb + normal.xyz)",
                 stride,
                 vertices.len()
             ));
         }
         let vcount = vertices.len() / stride_f;
 
-        // Pull out pos.xyz, apply transform.
+        // Pull pos.xyz, apply transform.
         let tm = mesh.transform; // column-major 4×4
         let mut positions: Vec<f32> = Vec::with_capacity(vcount * 3);
         for vi in 0..vcount {
@@ -441,7 +502,23 @@ impl MetalRenderer {
             MTLResourceOptions::StorageModeShared,
         );
 
-        let (index_buffer, triangle_count, indices_for_normals) =
+        // Pull normal.xyz (stride offset 6..8), rotate by upper-3×3
+        // of the transform, store as float4 (.xyz = normal, .w pad).
+        let mut vertex_normals: Vec<[f32; 4]> = Vec::with_capacity(vcount);
+        for vi in 0..vcount {
+            let nx = vertices[vi * stride_f + 6];
+            let ny = vertices[vi * stride_f + 7];
+            let nz = vertices[vi * stride_f + 8];
+            // Upper-3×3 rotation (M[0..2], M[4..6], M[8..10] in
+            // column-major) applied to the normal.
+            let rx = tm[0] * nx + tm[4] * ny + tm[8] * nz;
+            let ry = tm[1] * nx + tm[5] * ny + tm[9] * nz;
+            let rz = tm[2] * nx + tm[6] * ny + tm[10] * nz;
+            let n = Vec3::new(rx, ry, rz).normalize_or_zero();
+            vertex_normals.push([n.x, n.y, n.z, 0.0]);
+        }
+
+        let (index_buffer, triangle_count, indices_for_kernel) =
             if let Some(indices) = indices_opt {
                 if indices.len() % 3 != 0 {
                     return Err(anyhow!("index count {} not divisible by 3", indices.len()));
@@ -452,7 +529,7 @@ impl MetalRenderer {
                     MTLResourceOptions::StorageModeShared,
                 );
                 let tcount = (indices.len() / 3) as u32;
-                (Some(ib), tcount, Some(indices.as_slice()))
+                (Some(ib), tcount, indices.clone())
             } else {
                 if vcount % 3 != 0 {
                     return Err(anyhow!(
@@ -460,38 +537,17 @@ impl MetalRenderer {
                         vcount
                     ));
                 }
-                (None, (vcount / 3) as u32, None)
+                // Empty indices vec signals "use primitive*3+i directly".
+                (None, (vcount / 3) as u32, Vec::new())
             };
-
-        // Compute per-triangle flat normal from the (transformed)
-        // positions. Cross product of two edges, normalized; degenerate
-        // triangles get a zero normal (kernel branches on that).
-        let mut flat_normals: Vec<[f32; 4]> = Vec::with_capacity(triangle_count as usize);
-        let pos_at = |i: usize| -> Vec3 {
-            Vec3::new(positions[i * 3], positions[i * 3 + 1], positions[i * 3 + 2])
-        };
-        for tri in 0..triangle_count as usize {
-            let (i0, i1, i2) = if let Some(idx) = indices_for_normals {
-                (
-                    idx[tri * 3] as usize,
-                    idx[tri * 3 + 1] as usize,
-                    idx[tri * 3 + 2] as usize,
-                )
-            } else {
-                (tri * 3, tri * 3 + 1, tri * 3 + 2)
-            };
-            let v0 = pos_at(i0);
-            let v1 = pos_at(i1);
-            let v2 = pos_at(i2);
-            let n = (v1 - v0).cross(v2 - v0).normalize_or_zero();
-            flat_normals.push([n.x, n.y, n.z, 0.0]);
-        }
 
         Ok(MeshBuildResult {
             position_buffer,
             index_buffer,
             triangle_count,
-            flat_normals,
+            vertex_normals,
+            indices_for_kernel,
+            vertex_count: vcount as u32,
         })
     }
 
@@ -511,8 +567,9 @@ impl MetalRenderer {
 
         let accel = self.accel.as_ref().unwrap();
         let cam_buf = self.camera_buffer.as_ref().unwrap();
-        let color_buf = self.primitive_color_buffer.as_ref().unwrap();
-        let flat_norm_buf = self.flat_normals_buffer.as_ref().unwrap();
+        let mat_buf = self.material_buffer.as_ref().unwrap();
+        let vnorm_buf = self.vertex_normals_buffer.as_ref().unwrap();
+        let vidx_buf = self.vertex_indices_buffer.as_ref().unwrap();
         let geom_off_buf = self.geom_offsets_buffer.as_ref().unwrap();
         let lights_buf = self.lights_buffer.as_ref().unwrap();
 
@@ -523,10 +580,11 @@ impl MetalRenderer {
         enc.set_acceleration_structure(0, Some(&**accel));
         enc.use_resource(&**accel, MTLResourceUsage::Read);
         enc.set_buffer(1, Some(cam_buf), 0);
-        enc.set_buffer(2, Some(color_buf), 0);
-        enc.set_buffer(3, Some(flat_norm_buf), 0);
-        enc.set_buffer(4, Some(geom_off_buf), 0);
-        enc.set_buffer(5, Some(lights_buf), 0);
+        enc.set_buffer(2, Some(mat_buf), 0);
+        enc.set_buffer(3, Some(vnorm_buf), 0);
+        enc.set_buffer(4, Some(vidx_buf), 0);
+        enc.set_buffer(5, Some(geom_off_buf), 0);
+        enc.set_buffer(6, Some(lights_buf), 0);
 
         let tg_size = MTLSize { width: 16, height: 16, depth: 1 };
         let tg_count = MTLSize {
@@ -556,6 +614,60 @@ impl MetalRenderer {
             0,
         );
         Ok(pixels)
+    }
+}
+
+/// Convert one editor-side Material variant into the wire-format
+/// MaterialUniform the kernel consumes. The flags.x discriminator
+/// (0=Unlit, 1=Phong, 2=PBR) decides which BRDF the kernel
+/// evaluates; other params are stuffed into albedo / params and
+/// only the ones relevant to that BRDF get read.
+///
+/// Material variants the c-2 kernel handles:
+///   Unlit   -> flags.x = 0 (just outputs albedo, ignores lights)
+///   Phong   -> flags.x = 1 (Lambert + Blinn-Phong specular)
+///   Pbr     -> flags.x = 2 (Cook-Torrance GGX + Schlick)
+///
+/// Glass / Mirror / Shader -- not in c-2 scope. Glass + Mirror land
+/// in 7.5.6.d (refraction); Shader requires Slang transpile work.
+/// For now they collapse to Unlit with the base color.
+fn material_to_uniform(m: &Material) -> MaterialUniform {
+    match m {
+        Material::Unlit { color, vertex_mix } => MaterialUniform {
+            albedo: [color[0], color[1], color[2], *vertex_mix],
+            params: [0.0; 4],
+            flags: [0, 0, 0, 0],
+        },
+        Material::Phong {
+            color,
+            shininess,
+            ambient,
+        } => MaterialUniform {
+            albedo: [color[0], color[1], color[2], 0.0],
+            // .x = metallic (unused), .y = roughness (unused),
+            // .z = shininess, .w = ambient.
+            params: [0.0, 0.0, *shininess, *ambient],
+            flags: [1, 0, 0, 0],
+        },
+        Material::Pbr {
+            color,
+            metallic,
+            roughness,
+        } => MaterialUniform {
+            albedo: [color[0], color[1], color[2], 0.0],
+            // Clamp roughness to a safe floor; pure 0 produces a
+            // mirror with a div-by-zero risk in the GGX denominator.
+            params: [*metallic, roughness.max(0.04), 0.0, 0.0],
+            flags: [2, 0, 0, 0],
+        },
+        Material::Glass { color, .. }
+        | Material::Mirror { tint: color }
+        | Material::Shader { color, .. } => MaterialUniform {
+            // c-2 fallback: render as Unlit with the base color.
+            albedo: [color[0], color[1], color[2], 0.0],
+            params: [0.0; 4],
+            flags: [0, 0, 0, 0],
+        },
     }
 }
 

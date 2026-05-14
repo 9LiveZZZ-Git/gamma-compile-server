@@ -26,7 +26,7 @@
 use crate::backend::BackendKind;
 use crate::capability::Capabilities;
 use crate::render::Renderer;
-use crate::scene::{Camera, Light, Scene};
+use crate::scene::{Camera, Light, Material, Scene};
 use anyhow::Context;
 use futures_util::{SinkExt, StreamExt};
 use log::{info, warn};
@@ -345,6 +345,26 @@ async fn handle_client_msg(
                             }
                             Err(e) => {
                                 warn!("[stream] lights-params parse failed: {}", e);
+                            }
+                        }
+                    }
+                    // Sprint 7.5.6.c-2 -- materials Params path.
+                    // Live PhongMat.shininess / PhysicalMat.metallic
+                    // / etc drag without an AS rebuild. Array length
+                    // must match the scene's current mesh count;
+                    // mismatched length means the user changed
+                    // structure and the next Scene msg will catch up.
+                    if let Some(mats_val) = patch.get("materials") {
+                        match serde_json::from_value::<Vec<Material>>(mats_val.clone()) {
+                            Ok(mats) => {
+                                if let Some(r) = renderer.as_mut() {
+                                    if let Err(e) = r.update_materials(&mats) {
+                                        warn!("[stream] update_materials failed: {}", e);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                warn!("[stream] materials-params parse failed: {}", e);
                             }
                         }
                     }
