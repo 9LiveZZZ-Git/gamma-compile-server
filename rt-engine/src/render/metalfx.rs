@@ -26,6 +26,10 @@
 //! whether to fall back to the spatial denoiser or surface an error.
 
 #![cfg(target_os = "macos")]
+// Silence noisy `cfg(feature = "cargo-clippy")` warnings from objc 0.2's
+// sel_impl macro -- they're an artifact of the older objc crate's
+// approach to detecting clippy, not anything wrong with our code.
+#![allow(unexpected_cfgs)]
 
 use metal::{Device, MTLPixelFormat};
 use objc::runtime::{Class, Object, BOOL, NO, YES};
@@ -40,6 +44,20 @@ pub struct TemporalDenoisedScaler {
     pub output_width: u32,
     pub output_height: u32,
 }
+
+// `*mut Object` (the raw ObjC pointer) is not `Send` by default in
+// Rust, which means MetalRenderer (which now contains this scaler)
+// wouldn't be `Send` either -- breaks tokio's `spawn` which requires
+// a Send future. ObjC objects ARE safe to *move* between threads as
+// long as we don't access them concurrently; Rust's `&mut self`
+// borrow rules already enforce single-threaded access at the call
+// sites. Same pattern metal-rs itself uses for its wrappers.
+//
+// Sync (= `&` reference shared across threads) we don't actually
+// need; we only ever have one owner at a time. Marking it anyway
+// for symmetry and to match metal-rs's wrappers.
+unsafe impl Send for TemporalDenoisedScaler {}
+unsafe impl Sync for TemporalDenoisedScaler {}
 
 impl Drop for TemporalDenoisedScaler {
     fn drop(&mut self) {
