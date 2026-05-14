@@ -49,6 +49,7 @@ pub struct Renderer {
     // the stub (no upscale path here).
     pub render_width: u32,
     pub render_height: u32,
+    pub requested_render_scale: f32,
 }
 
 #[cfg(not(target_os = "macos"))]

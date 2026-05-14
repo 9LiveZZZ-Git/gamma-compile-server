@@ -211,6 +211,13 @@ pub struct MetalRenderer {
     /// spatial fallback can't upscale, so we pin scale=1.0).
     pub render_width: u32,
     pub render_height: u32,
+    /// f.3.g-fix1 -- the render_scale value the caller REQUESTED,
+    /// regardless of whether MetalFX accepted it. ipc.rs compares
+    /// this against want_render_scale to decide whether to rebuild
+    /// the renderer; comparing against render_width/render_height
+    /// is wrong when TDS rejected the requested scale and we fell
+    /// back to render=display (causes a rebuild every frame).
+    pub requested_render_scale: f32,
 
     // Sprint 7.5.6.e -- path-tracing accumulation. Persistent RGBA32F
     // texture into which each frame's sample contribution gets added.
@@ -545,6 +552,10 @@ impl MetalRenderer {
             height,
             render_width,
             render_height,
+            // f.3.g-fix1 -- the value we were ASKED for, not what we
+            // ended up using. ipc.rs compares this when deciding
+            // whether to rebuild.
+            requested_render_scale: requested_scale,
             accum_texture,
             normal_texture,
             depth_texture,

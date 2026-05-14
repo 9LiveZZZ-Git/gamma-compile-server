@@ -177,16 +177,19 @@ async fn handle_connection(
                 let need_new = renderer
                     .as_ref()
                     .map(|r| {
-                        // f.3.g -- rebuild if display dims OR the
-                        // effective render dims drift. Recomputing the
-                        // expected render dims here avoids storing
-                        // render_scale separately on the renderer.
-                        let expected_rw = (((want_dims.0 as f32) * want_render_scale).round() as u32).max(1);
-                        let expected_rh = (((want_dims.1 as f32) * want_render_scale).round() as u32).max(1);
+                        // f.3.g-fix1 -- compare against the
+                        // REQUESTED render_scale, not the effective
+                        // render dims. When TDS rejects a scale and
+                        // the renderer falls back to render=display,
+                        // expected_rw != r.render_width forever -- a
+                        // rebuild every frame, which drops
+                        // pending_scene on the second rebuild and
+                        // produces a black screen. The requested
+                        // value matches across builds even when the
+                        // fallback changed the dims.
                         r.width != want_dims.0
                             || r.height != want_dims.1
-                            || r.render_width != expected_rw
-                            || r.render_height != expected_rh
+                            || (r.requested_render_scale - want_render_scale).abs() > 1e-3
                     })
                     .unwrap_or(true);
                 if need_new {
