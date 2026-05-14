@@ -280,6 +280,12 @@ kernel void rt_scene(
     texture2d<float, access::write>     depthTex    [[texture(3)]],
     texture2d<float, access::write>     motionTex   [[texture(4)]],
     texture2d<float, access::write>     albedoTex   [[texture(5)]],
+    // f.3.c -- noisy single-sample color (RGBA16F). MetalFX's color
+    // input. The kernel's `sample` value goes here un-divided; MetalFX
+    // does its own temporal accumulation internally using motion
+    // vectors. The engine-side accumulation (accumTex) is kept for
+    // the spatial-denoiser fallback path.
+    texture2d<float, access::write>     noisyColorTex [[texture(6)]],
     primitive_acceleration_structure    accel       [[buffer(0)]],
     constant CameraUniform&  camera                 [[buffer(1)]],
     constant MaterialUniform* materials             [[buffer(2)]],
@@ -493,10 +499,11 @@ kernel void rt_scene(
         sample += throughput * hemisphere_ibl(r.direction);
     }
 
-    // ── Accumulate ───────────────────────────────────────────────────
+    // ── Accumulate (kept for spatial-denoise fallback) ───────────────
     // First frame: write sample as initial value. Subsequent frames:
-    // read prior accum, add, write back. accumTex is RGBA32F so we
-    // don't lose precision summing thousands of samples.
+    // read prior accum, add, write back. RGBA32F so we don't lose
+    // precision summing thousands of samples. MetalFX-path doesn't
+    // need this -- it consumes the noisy single-sample texture below.
     float3 new_accum;
     if (frame == 0u) {
         new_accum = sample;
@@ -504,6 +511,13 @@ kernel void rt_scene(
         new_accum = accumTex.read(gid).rgb + sample;
     }
     accumTex.write(float4(new_accum, 0.0), gid);
+
+    // f.3.c -- noisy single-sample color for MetalFX. Just this
+    // frame's path-traced sample, NOT the running accumulation.
+    // MetalFX's temporal accumulator handles convergence using
+    // motion vectors; we just need to give it the per-frame Monte
+    // Carlo result.
+    noisyColorTex.write(float4(sample, 1.0), gid);
 
     // ── G-buffer writes ───────────────────────────────────────────
     // Normal: .xyz = world-space normal at primary opaque hit, .w =
@@ -635,4 +649,31 @@ kernel void rt_denoise(
     // (= cleaning up the 1-spp noise).
     const float3 out_color = mix(unfiltered, filtered, taper);
     outTex.write(float4(out_color, 1.0), gid);
+}
+
+// ── Tonemap kernel (f.3.c) ───────────────────────────────────────────
+//
+// Copies the MetalFX output (RGBA16Float, HDR) into the display
+// texture (RGBA8Unorm). For c-3 v1 this is just a Reinhard-ish
+// tonemap (color / (1 + color)) plus a gamma 2.2 correction --
+// keeps highlights from clipping to flat white while preserving
+// mid-tones. Polish (ACES, filmic, exposure curve) lands in f.3.d.
+
+kernel void rt_tonemap(
+    texture2d<float, access::write> outTex  [[texture(0)]],
+    texture2d<float, access::read>  hdrTex  [[texture(1)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    const uint w = outTex.get_width();
+    const uint h = outTex.get_height();
+    if (gid.x >= w || gid.y >= h) return;
+
+    float3 c = max(hdrTex.read(gid).rgb, float3(0.0));
+    // Reinhard
+    c = c / (1.0 + c);
+    // Approximate sRGB gamma -- compensates for the linear-space
+    // accumulation. RGBA8Unorm storage is linear; the browser /
+    // editor pipeline does its own sRGB conversion downstream.
+    // c = pow(c, float3(1.0 / 2.2));  // optional if downstream is sRGB
+    outTex.write(float4(c, 1.0), gid);
 }

@@ -189,13 +189,26 @@ pub struct MetalRenderer {
     depth_texture: Texture,
     motion_texture: Texture,
     albedo_texture: Texture,
+    // Sprint 7.5.6.f.3.c -- noisy single-sample color (RGBA16F).
+    // MetalFX's color input: this frame's path-traced sample, NOT
+    // the engine-side running accumulation. MetalFX does its own
+    // temporal accumulation internally using motion vectors.
+    noisy_color_texture: Texture,
+    // MetalFX's output texture (RGBA16F). HDR float so the
+    // temporal blend doesn't quantize. A separate tonemap kernel
+    // then converts to RGBA8 for the display.
+    metalfx_output_texture: Texture,
     // Sprint 7.5.6.f.3 -- MetalFX TemporalDenoisedScaler. Apple's
     // neural-net temporal denoiser for path-traced rendering. None
     // if creation failed (older macOS, unsupported GPU, or build
-    // running without MetalFX framework available). In f.3.a we
-    // just probe creation; f.3.b/c add G-buffers + wire the scaler
-    // into the render loop.
+    // running without MetalFX framework available). f.3.c routes
+    // rendering through it when present; falls back to rt_denoise
+    // (spatial filter) when None.
     metalfx_scaler: Option<TemporalDenoisedScaler>,
+    /// Tonemap pipeline: copies the MetalFX output (RGBA16F) into the
+    /// display texture (RGBA8). For c-3 v1 this is a straight clamp +
+    /// linear-to-sRGB-ish remap; ACES / Reinhard etc come in polish.
+    tonemap_pipeline: ComputePipelineState,
     // Sprint 7.5.6.f.3.b -- camera matrix history for motion vector
     // computation. Two fields:
     //   current_view_proj: the view*projection matrix of the most
@@ -331,6 +344,33 @@ impl MetalRenderer {
         albedo_desc.set_storage_mode(MTLStorageMode::Private);
         let albedo_texture = device.new_texture(&albedo_desc);
 
+        // Sprint 7.5.6.f.3.c -- noisy single-sample color (path tracer
+        // input to MetalFX) + MetalFX output. Both RGBA16Float so
+        // we don't quantize HDR samples before the temporal blend.
+        let noisy_desc = TextureDescriptor::new();
+        noisy_desc.set_width(width as u64);
+        noisy_desc.set_height(height as u64);
+        noisy_desc.set_pixel_format(MTLPixelFormat::RGBA16Float);
+        noisy_desc.set_usage(MTLTextureUsage::ShaderWrite | MTLTextureUsage::ShaderRead);
+        noisy_desc.set_storage_mode(MTLStorageMode::Private);
+        let noisy_color_texture = device.new_texture(&noisy_desc);
+
+        let fxout_desc = TextureDescriptor::new();
+        fxout_desc.set_width(width as u64);
+        fxout_desc.set_height(height as u64);
+        fxout_desc.set_pixel_format(MTLPixelFormat::RGBA16Float);
+        fxout_desc.set_usage(MTLTextureUsage::ShaderWrite | MTLTextureUsage::ShaderRead);
+        fxout_desc.set_storage_mode(MTLStorageMode::Private);
+        let metalfx_output_texture = device.new_texture(&fxout_desc);
+
+        // Tonemap pipeline (RGBA16F MetalFX output -> RGBA8 display).
+        let tonemap_func = lib
+            .get_function("rt_tonemap", None)
+            .map_err(|e| anyhow!("kernel function 'rt_tonemap' not found: {}", e))?;
+        let tonemap_pipeline = device
+            .new_compute_pipeline_state_with_function(&tonemap_func)
+            .map_err(|e| anyhow!("tonemap pipeline create failed: {}", e))?;
+
         // Per-frame state uniform: frame_count + prev_view_proj.
         // Sized for PathStateUniform (80 bytes). Updated in place
         // each render via the shared buffer's contents() pointer.
@@ -389,7 +429,10 @@ impl MetalRenderer {
             depth_texture,
             motion_texture,
             albedo_texture,
+            noisy_color_texture,
+            metalfx_output_texture,
             metalfx_scaler,
+            tonemap_pipeline,
             current_view_proj: None,
             view_proj_history: None,
             frame_count: 0,
@@ -857,9 +900,11 @@ impl MetalRenderer {
         let cb = self.queue.new_command_buffer();
 
         // ── Path-tracing dispatch ─────────────────────────────────
-        // Writes:  accum_texture (RGBA32F) + normal (RGBA32F) +
-        //          depth (R32F) + motion (RG16F) + albedo (RGBA8U).
-        // The display texture is written by the SECOND (denoise) pass.
+        // Writes:  accumTex (RGBA32F) + noisy_color (RGBA16F) +
+        //          normal (RGBA32F) + depth (R32F) + motion (RG16F)
+        //          + albedo (RGBA8U).
+        // Display texture is written by either MetalFX-then-tonemap
+        // or the spatial denoiser fallback below.
         let enc = cb.new_compute_command_encoder();
         enc.set_compute_pipeline_state(&self.pipeline);
         enc.set_texture(1, Some(&self.accum_texture));
@@ -867,6 +912,7 @@ impl MetalRenderer {
         enc.set_texture(3, Some(&self.depth_texture));
         enc.set_texture(4, Some(&self.motion_texture));
         enc.set_texture(5, Some(&self.albedo_texture));
+        enc.set_texture(6, Some(&self.noisy_color_texture));
         enc.set_acceleration_structure(0, Some(&**accel));
         enc.use_resource(&**accel, MTLResourceUsage::Read);
         enc.set_buffer(1, Some(cam_buf), 0);
@@ -886,23 +932,54 @@ impl MetalRenderer {
         enc.dispatch_thread_groups(tg_count, tg_size);
         enc.end_encoding();
 
-        // ── Denoise dispatch ──────────────────────────────────────
-        // Reads:  accum_texture + normal_texture
-        // Writes: display texture (RGBA8)
-        // 5x5 edge-aware blur with normal similarity. Static scenes
-        // (accum already converged) see almost no change; orbiting
-        // scenes (1-spp noise) get noticeably cleaner. Both kernels
-        // run as separate compute encoders in the same command
-        // buffer; Metal inserts the texture barrier between them
-        // automatically.
-        let dn_enc = cb.new_compute_command_encoder();
-        dn_enc.set_compute_pipeline_state(&self.denoise_pipeline);
-        dn_enc.set_texture(0, Some(&self.texture));
-        dn_enc.set_texture(1, Some(&self.accum_texture));
-        dn_enc.set_texture(2, Some(&self.normal_texture));
-        dn_enc.set_buffer(7, Some(&self.path_state_buffer), 0);
-        dn_enc.dispatch_thread_groups(tg_count, tg_size);
-        dn_enc.end_encoding();
+        // ── Denoise / display dispatch ────────────────────────────
+        // Two paths: MetalFX (preferred; temporal denoise + AA) and
+        // the c-f spatial filter fallback. They write the same
+        // display texture so the readback below doesn't care which.
+        if let Some(scaler) = self.metalfx_scaler.as_ref() {
+            // MetalFX path.
+            //   1. Configure scaler inputs/output for this frame.
+            //   2. encodeToCommandBuffer.
+            //   3. Tonemap MetalFX's RGBA16F output to RGBA8 display.
+            scaler.set_color_texture(&self.noisy_color_texture);
+            scaler.set_depth_texture(&self.depth_texture);
+            scaler.set_motion_texture(&self.motion_texture);
+            scaler.set_normal_texture(&self.normal_texture);
+            scaler.set_diffuse_albedo_texture(&self.albedo_texture);
+            scaler.set_output_texture(&self.metalfx_output_texture);
+            // Reset = true on frame 0 after a reset_accumulation so
+            // MetalFX drops its temporal history and starts fresh.
+            scaler.set_reset(self.frame_count == 0);
+            // Motion is stored in UV-space (-1..1). Scale to pixels.
+            scaler.set_motion_vector_scale(
+                self.width as f32,
+                self.height as f32,
+            );
+            // No subpixel jitter yet (kernel jitters per-pixel
+            // randomly, not per-frame globally). f.3.d will switch
+            // to a Halton sequence and pass it here.
+            scaler.set_jitter_offset(0.0, 0.0);
+
+            scaler.encode_to_command_buffer(cb);
+
+            // Tonemap: RGBA16F MetalFX output -> RGBA8 display.
+            let tm_enc = cb.new_compute_command_encoder();
+            tm_enc.set_compute_pipeline_state(&self.tonemap_pipeline);
+            tm_enc.set_texture(0, Some(&self.texture));
+            tm_enc.set_texture(1, Some(&self.metalfx_output_texture));
+            tm_enc.dispatch_thread_groups(tg_count, tg_size);
+            tm_enc.end_encoding();
+        } else {
+            // Fallback: existing c-f spatial denoiser.
+            let dn_enc = cb.new_compute_command_encoder();
+            dn_enc.set_compute_pipeline_state(&self.denoise_pipeline);
+            dn_enc.set_texture(0, Some(&self.texture));
+            dn_enc.set_texture(1, Some(&self.accum_texture));
+            dn_enc.set_texture(2, Some(&self.normal_texture));
+            dn_enc.set_buffer(7, Some(&self.path_state_buffer), 0);
+            dn_enc.dispatch_thread_groups(tg_count, tg_size);
+            dn_enc.end_encoding();
+        }
 
         cb.commit();
         cb.wait_until_completed();

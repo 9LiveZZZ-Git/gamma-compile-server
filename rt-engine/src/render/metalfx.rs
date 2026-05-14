@@ -174,20 +174,99 @@ impl TemporalDenoisedScaler {
         }
     }
 
-    /// Returns the raw ObjC pointer. Used by the encode method (and
-    /// will be used in f.3.c when we wire up per-frame texture
-    /// bindings before `encodeToCommandBuffer:`).
+    /// Returns the raw ObjC pointer. Useful for debugging.
     pub fn as_ptr(&self) -> *mut Object {
         self.ptr
     }
 
-    /// Encode a denoise pass into the given command buffer. f.3.c
-    /// will fill this in; for f.3.a we just verify the scaler can
-    /// be created.
-    #[allow(dead_code)]
-    pub fn encode_placeholder(&self) {
-        // Will become: msg_send![self.ptr, encodeToCommandBuffer: cb_ptr]
+    /// Sprint 7.5.6.f.3.c -- texture property setters. Each MetalFX
+    /// input/output gets its own setter on the scaler instance.
+    /// All are called per-frame before `encode_to_command_buffer`.
+    pub fn set_color_texture(&self, tex: &metal::Texture) {
+        unsafe {
+            let p = texture_to_ptr(tex);
+            let _: () = msg_send![self.ptr, setColorTexture: p];
+        }
     }
+    pub fn set_depth_texture(&self, tex: &metal::Texture) {
+        unsafe {
+            let p = texture_to_ptr(tex);
+            let _: () = msg_send![self.ptr, setDepthTexture: p];
+        }
+    }
+    pub fn set_motion_texture(&self, tex: &metal::Texture) {
+        unsafe {
+            let p = texture_to_ptr(tex);
+            let _: () = msg_send![self.ptr, setMotionTexture: p];
+        }
+    }
+    pub fn set_normal_texture(&self, tex: &metal::Texture) {
+        unsafe {
+            let p = texture_to_ptr(tex);
+            let _: () = msg_send![self.ptr, setNormalTexture: p];
+        }
+    }
+    pub fn set_diffuse_albedo_texture(&self, tex: &metal::Texture) {
+        unsafe {
+            let p = texture_to_ptr(tex);
+            let _: () = msg_send![self.ptr, setDiffuseAlbedoTexture: p];
+        }
+    }
+    pub fn set_output_texture(&self, tex: &metal::Texture) {
+        unsafe {
+            let p = texture_to_ptr(tex);
+            let _: () = msg_send![self.ptr, setOutputTexture: p];
+        }
+    }
+
+    /// Reset internal history (e.g. on a hard scene change). Tell
+    /// MetalFX to drop its temporal accumulation rather than blend
+    /// stale samples with the new content.
+    pub fn set_reset(&self, reset: bool) {
+        let b: BOOL = if reset { YES } else { NO };
+        unsafe {
+            let _: () = msg_send![self.ptr, setReset: b];
+        }
+    }
+
+    /// Subpixel jitter offset in the range [-0.5, 0.5]. MetalFX uses
+    /// this to do proper sub-pixel reconstruction across frames.
+    /// Must match whatever subpixel offset the path tracer used for
+    /// the primary ray on this frame.
+    pub fn set_jitter_offset(&self, x: f32, y: f32) {
+        unsafe {
+            let _: () = msg_send![self.ptr, setJitterOffsetX: x];
+            let _: () = msg_send![self.ptr, setJitterOffsetY: y];
+        }
+    }
+
+    /// Motion-vector scale: multiplies the motion texture's values
+    /// to get the pixel-space delta. Our motion texture stores
+    /// UV-space deltas in [-1, 1], so scale = (width, height) gives
+    /// the correct pixel offset MetalFX expects.
+    pub fn set_motion_vector_scale(&self, x: f32, y: f32) {
+        unsafe {
+            let _: () = msg_send![self.ptr, setMotionVectorScaleX: x];
+            let _: () = msg_send![self.ptr, setMotionVectorScaleY: y];
+        }
+    }
+
+    /// Encode the denoise + upscale pass into the given command
+    /// buffer. All texture properties must have been set first.
+    pub fn encode_to_command_buffer(&self, cb: &metal::CommandBufferRef) {
+        unsafe {
+            use metal::foreign_types::ForeignTypeRef;
+            let cb_ptr = cb.as_ptr() as *mut Object;
+            let _: () = msg_send![self.ptr, encodeToCommandBuffer: cb_ptr];
+        }
+    }
+}
+
+fn texture_to_ptr(tex: &metal::Texture) -> *mut Object {
+    use metal::foreign_types::ForeignTypeRef;
+    use std::ops::Deref;
+    let r = tex.deref();
+    r.as_ptr() as *mut Object
 }
 
 /// Internal: extract the raw ObjC pointer from metal-rs's wrapper.
