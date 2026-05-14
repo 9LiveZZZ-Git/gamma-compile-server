@@ -59,7 +59,12 @@ constant float PI = 3.14159265358979;
 constant float SHADOW_BIAS = 0.001;
 constant float BOUNCE_BIAS = 0.001;
 constant int   MAX_BOUNCES = 6;
-constant float3 SKY_COLOR = float3(0.05, 0.06, 0.10);
+// Slack threshold for the back-face normal flip. Hits whose dot(N,
+// rd) is in [-THR..THR] are treated as front-face. Without this, the
+// silhouette edge of a mirror ball (where dot ≈ 0) flips spuriously
+// and inverts the reflection direction, producing the "bright top,
+// dark bottom" inversion artifact.
+constant float NORMAL_FLIP_THR = 0.05;
 
 // ── BRDF helpers ─────────────────────────────────────────────────────
 
@@ -236,7 +241,12 @@ kernel void rt_scene(
     for (int bounce = 0; bounce < MAX_BOUNCES; bounce++) {
         intersection_result<triangle_data> hit = isr.intersect(r, accel);
         if (hit.type != intersection_type::triangle) {
-            accum += throughput * SKY_COLOR;
+            // Sprint 7.5.6.d follow-up: gradient sky via the same
+            // hemisphere_ibl that the PBR ambient uses. Dark blue
+            // up high, warmer gray near the horizon, dim ground
+            // color when looking down. Free skybox until §5.4
+            // Environments lands a real HDRI probe.
+            accum += throughput * hemisphere_ibl(r.direction);
             terminated = true;
             break;
         }
@@ -264,11 +274,14 @@ kernel void rt_scene(
         const float2 bary = hit.triangle_barycentric_coord;
         const float bw = 1.0 - bary.x - bary.y;
         float3 N_geom = normalize(bw * n0 + bary.x * n1 + bary.y * n2);
-        // For Glass: we need to know which side of the surface we hit
-        // (entering vs. exiting the medium). dot(N_geom, rd) < 0 means
-        // we're hitting from the front (entering); > 0 means back-face
-        // (exiting). For Mirror / Phong / PBR, flip to face the viewer.
-        const bool entering = dot(N_geom, r.direction) < 0.0;
+        // Back-face check with slack so near-tangent hits at the
+        // silhouette of a closed mesh (mirror ball, glass ball)
+        // don't get the normal flipped the wrong way. Editor meshes
+        // produce outward-facing normals consistently; we only flip
+        // when the geometry is CLEARLY a back-face hit (dot well
+        // above zero), not just numerical noise around the equator.
+        const float ndotrd = dot(N_geom, r.direction);
+        const bool entering = ndotrd < NORMAL_FLIP_THR;
         float3 N = entering ? N_geom : -N_geom;
 
         const MaterialUniform mat = materials[gid_hit];
@@ -329,7 +342,7 @@ kernel void rt_scene(
         // Bounce budget exhausted -- assume the ray escapes to sky.
         // Prevents the pixel from going pure black on a long mirror
         // hall of mirrors / inside-glass scenario.
-        accum += throughput * SKY_COLOR;
+        accum += throughput * hemisphere_ibl(r.direction);
     }
 
     outTex.write(float4(accum, 1.0), gid);
