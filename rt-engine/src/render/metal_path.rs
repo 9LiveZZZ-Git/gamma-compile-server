@@ -630,7 +630,10 @@ impl MetalRenderer {
 
     /// Render one frame. If no scene has been pushed yet, returns
     /// clear-color pixels CPU-side (cheap; no GPU dispatch).
-    pub fn render_frame(&self) -> anyhow::Result<Vec<u8>> {
+    ///
+    /// `&mut self` because c-e (path tracing) advances `self.frame_count`
+    /// after each successful render. Pre-c-e this was `&self`.
+    pub fn render_frame(&mut self) -> anyhow::Result<Vec<u8>> {
         if !self.has_scene {
             let r = (self.clear_color[0].clamp(0.0, 1.0) * 255.0) as u8;
             let g = (self.clear_color[1].clamp(0.0, 1.0) * 255.0) as u8;

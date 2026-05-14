@@ -203,8 +203,10 @@ async fn handle_connection(
                         }
                     }
                 }
-                // Render + send.
-                if let Some(r) = renderer.as_ref() {
+                // Render + send. as_mut because c-e's render_frame
+                // advances frame_count internally for path-tracing
+                // accumulation.
+                if let Some(r) = renderer.as_mut() {
                     match r.render_frame() {
                         Ok(pixels) => {
                             // Log every 60th frame so we know
