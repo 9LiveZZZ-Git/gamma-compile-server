@@ -173,14 +173,52 @@ struct LightSample {
     float  attenuation;
 };
 
-inline LightSample resolve_light(constant LightSlot& slot, float3 hit_point) {
+inline LightSample resolve_light(constant LightSlot& slot, float3 hit_point,
+                                thread uint& rng) {
     LightSample s;
     const uint type = slot.flags.x;
     if (type == 0u) {
+        // Directional.
         s.L = slot.pos_or_dir.xyz;
         s.distance = 1e6;
         s.attenuation = 1.0;
+    } else if (type == 3u) {
+        // f.3.h -- Area light. LightSlot packing:
+        //   pos_or_dir = (center.xyz, width)
+        //   spot_dir   = (normal.xyz, height)
+        //   color      = (rgb, intensity)
+        //   flags.x    = 3
+        // Sample one random point uniformly on the rectangle per
+        // shadow-ray. Each primary ray lands on a different sample,
+        // and TDS averages across primaries -> soft penumbra naturally.
+        const float3 center = slot.pos_or_dir.xyz;
+        const float  hw     = slot.pos_or_dir.w * 0.5;
+        const float3 n      = slot.spot_dir.xyz;
+        const float  hh     = slot.spot_dir.w * 0.5;
+        // Build a tangent basis aligned with `n`. Pick an up-reference
+        // that's not parallel to n (the y-axis works unless the light
+        // faces near-straight-up, in which case fall back to x).
+        const float3 up_ref = (abs(n.y) < 0.9) ? float3(0, 1, 0) : float3(1, 0, 0);
+        const float3 t = normalize(cross(up_ref, n));
+        const float3 b = cross(n, t);
+        const float u1 = rand01(rng) * 2.0 - 1.0;  // [-1, +1]
+        const float u2 = rand01(rng) * 2.0 - 1.0;
+        const float3 sample_pos = center + t * (u1 * hw) + b * (u2 * hh);
+        const float3 to_light = sample_pos - hit_point;
+        s.distance = length(to_light);
+        s.L = (s.distance > 0.0) ? to_light / s.distance : float3(0, 1, 0);
+        // Monte Carlo weight for uniform sampling over the rect:
+        //   contribution = Li * cos_surface * cos_light * area / r^2
+        // shade_direct multiplies by lights.slots[i].color.xyz *
+        // intensity (= Li) and n_dot_l (= cos_surface) separately, so
+        // fold the remaining factors (cos_light, area, 1/r^2) into
+        // attenuation.
+        const float cos_light = max(0.0, dot(n, -s.L));
+        const float area = slot.pos_or_dir.w * slot.spot_dir.w; // width * height
+        const float r2 = max(s.distance * s.distance, 1e-4);
+        s.attenuation = cos_light * area / r2;
     } else {
+        // Point (type 1) or Spot (type 2).
         float3 to_light = slot.pos_or_dir.xyz - hit_point;
         s.distance = length(to_light);
         s.L = (s.distance > 0.0) ? to_light / s.distance : float3(0, 1, 0);
@@ -208,7 +246,8 @@ inline float3 shade_direct(
     float3 hit_point,
     primitive_acceleration_structure accel,
     thread intersector<triangle_data>& shadow_isr,
-    constant LightsUniform& lights
+    constant LightsUniform& lights,
+    thread uint& rng                    // f.3.h -- needed for area-light sampling
 ) {
     if (mtype == 0u) return albedo;
 
@@ -220,7 +259,7 @@ inline float3 shade_direct(
         // Phong direct.
         float3 diffuse = float3(0.0), specular = float3(0.0);
         for (uint i = 0; i < nLights; i++) {
-            const LightSample ls = resolve_light(lights.slots[i], hit_point);
+            const LightSample ls = resolve_light(lights.slots[i], hit_point, rng);
             if (ls.attenuation <= 0.0) continue;
             const float n_dot_l = max(0.0, dot(N, ls.L));
             if (n_dot_l <= 0.0) continue;
@@ -244,7 +283,7 @@ inline float3 shade_direct(
         const float3 F0 = mix(float3(0.04), albedo, metallic);
         float3 Lo = float3(0.0);
         for (uint i = 0; i < nLights; i++) {
-            const LightSample ls = resolve_light(lights.slots[i], hit_point);
+            const LightSample ls = resolve_light(lights.slots[i], hit_point, rng);
             if (ls.attenuation <= 0.0) continue;
             const float n_dot_l = max(0.0, dot(N, ls.L));
             if (n_dot_l <= 0.0) continue;
@@ -330,24 +369,17 @@ kernel void rt_scene(
     // Clamped here too; 8 is the editor's `final` preset ceiling.
     const uint MAX_BOUNCES = clamp(path.max_bounces, 1u, 8u);
 
-    // Sub-pixel jittered primary ray. f.3.d -- one global offset
-    // for the entire frame from a Halton(2, 3) sequence (path.jitter
-    // .xy in [0, 1]); over many frames this covers the sub-pixel
-    // grid uniformly. MetalFX gets the same value (centered to
-    // [-0.5, 0.5]) so it can correlate sub-pixel samples across
-    // frames. Per-sample variance comes from the RNG seed (next
-    // line), not from sub-pixel offset -- MetalFX expects ONE jitter
-    // value per frame.
-    const float u = (float(gid.x) + path.jitter.x) / float(w);
-    const float v = (float(gid.y) + path.jitter.y) / float(h);
-    const float screen_x = (2.0 * u - 1.0) * camera.misc.x * camera.misc.y;
-    const float screen_y = (1.0 - 2.0 * v) * camera.misc.x;
-    const float3 ray_origin    = camera.eye.xyz;
-    const float3 ray_direction = normalize(
-        screen_x * camera.right.xyz
-      + screen_y * camera.up.xyz
-      + camera.forward.xyz
-    );
+    // f.3.h -- ray origin is per-pixel; ray direction is now
+    // per-SAMPLE (computed inside the SPP loop). Pre-fix h the
+    // direction was computed once per pixel using path.jitter only,
+    // so SPP cleaned up bounce/specular variance but never
+    // contributed to edge AA. Now sample 0 still uses path.jitter
+    // (TDS history reprojection finds the canonical sub-pixel
+    // position) and samples 1..SPP-1 use rand01 for fresh sub-pixel
+    // positions. Averaged into sample_accum / SPP, this gives true
+    // in-frame anti-aliasing of silhouettes that TDS's cross-frame
+    // accumulation couldn't deliver while the camera was in motion.
+    const float3 ray_origin = camera.eye.xyz;
 
     intersector<triangle_data> isr;
     isr.assume_geometry_type(geometry_type::triangle);
@@ -375,6 +407,30 @@ kernel void rt_scene(
         // Per-sample RNG seed -- decorrelated across both pixels and
         // samples within a frame, plus across frames.
         thread uint rng  = init_rng(gid, frame * 16u + s, 0u);
+
+        // f.3.h -- per-sample sub-pixel offset. Sample 0 uses the
+        // per-frame Halton jitter (so TDS can reproject history at
+        // the canonical sub-pixel position). Samples 1..SPP-1
+        // randomize over the pixel via the RNG -- THIS is what
+        // delivers in-frame edge AA. RNG advance is intentional;
+        // bounce sampling later in the loop continues from here.
+        float sub_x, sub_y;
+        if (s == 0u) {
+            sub_x = path.jitter.x;
+            sub_y = path.jitter.y;
+        } else {
+            sub_x = rand01(rng);
+            sub_y = rand01(rng);
+        }
+        const float u = (float(gid.x) + sub_x) / float(w);
+        const float v = (float(gid.y) + sub_y) / float(h);
+        const float screen_x = (2.0 * u - 1.0) * camera.misc.x * camera.misc.y;
+        const float screen_y = (1.0 - 2.0 * v) * camera.misc.x;
+        const float3 ray_direction = normalize(
+            screen_x * camera.right.xyz
+          + screen_y * camera.up.xyz
+          + camera.forward.xyz
+        );
 
         // Re-init the ray each sample because the bounce loop
         // mutates r.origin / r.direction.
@@ -545,7 +601,7 @@ kernel void rt_scene(
         // Direct lighting at this hit.
         const float3 direct = shade_direct(
             mtype, albedo, metallic, roughness, shininess, ambient_mx,
-            N, V, n_dot_v, hit_point, accel, shadow_isr, lights
+            N, V, n_dot_v, hit_point, accel, shadow_isr, lights, rng
         );
         sample += throughput * direct;
 

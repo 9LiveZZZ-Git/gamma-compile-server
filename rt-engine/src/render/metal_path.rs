@@ -1386,9 +1386,25 @@ fn build_lights_uniform(lights: &[Light]) -> LightsUniform {
                     flags: [2, 0, 0, 0],
                 }
             }
-            // Area lights deferred to §5.6.d (refraction sprint).
-            // For c-3 they degrade to "no light contribution".
-            Light::Area { .. } => continue,
+            // f.3.h -- Area light. Packing (matches the kernel's
+            // resolve_light type==3u branch):
+            //   pos_or_dir = (center.xyz, width)
+            //   spot_dir   = (normal.xyz, height)
+            //   color      = (rgb, intensity)
+            //   flags.x    = 3
+            // Kernel Monte-Carlo-samples one point on the rect per
+            // shadow ray, so soft shadows fall out of cross-primary
+            // TDS averaging without any per-light loop blowup.
+            Light::Area { position, normal, width, height, color, intensity } => {
+                let n = Vec3::from(*normal).normalize_or_zero();
+                LightSlot {
+                    pos_or_dir: [position[0], position[1], position[2], width.max(0.001)],
+                    color: [color[0], color[1], color[2], *intensity],
+                    spot_dir: [n.x, n.y, n.z, height.max(0.001)],
+                    range_cones: [0.0; 4],
+                    flags: [3, 0, 0, 0],
+                }
+            }
         };
         slots.push(slot);
     }
