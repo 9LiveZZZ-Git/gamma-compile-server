@@ -40,13 +40,27 @@ use tokio_tungstenite::tungstenite::Message;
 #[serde(tag = "type", rename_all = "kebab-case")]
 enum ClientMsg {
     Hello,
-    Configure { width: u32, height: u32 },
+    Configure {
+        width: u32,
+        height: u32,
+        // f.3.f-prep -- internal render fraction of (width, height).
+        // The kernel will shade at (w*renderScale, h*renderScale)
+        // and the TDS scaler will upscale to (w, h). For now we log
+        // the requested value but render at (w, h) directly; the
+        // upscale-input != output wiring lands next sprint.
+        // Defaults to 1.0 (no upscale) when the field is missing so
+        // editor versions before this field shipped stay compatible.
+        #[serde(default = "default_render_scale", rename = "renderScale")]
+        render_scale: f32,
+    },
     Scene { patch: serde_json::Value },
     Params { patch: serde_json::Value },
     RenderStart,
     RenderStop,
     Shutdown,
 }
+
+fn default_render_scale() -> f32 { 1.0 }
 
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
@@ -265,9 +279,20 @@ async fn handle_client_msg(
                     };
                     tx.send(Message::Text(serde_json::to_string(&reply)?.into())).await?;
                 }
-                Ok(ClientMsg::Configure { width, height }) => {
+                Ok(ClientMsg::Configure { width, height, render_scale }) => {
                     *want_dims = (width.max(1).min(4096), height.max(1).min(4096));
-                    info!("[stream] configure: {}x{}", want_dims.0, want_dims.1);
+                    let rs = render_scale.clamp(0.25, 1.0);
+                    let (rw, rh) = (
+                        ((want_dims.0 as f32) * rs).round().max(1.0) as u32,
+                        ((want_dims.1 as f32) * rs).round().max(1.0) as u32,
+                    );
+                    if (rs - 1.0).abs() < 1e-3 {
+                        info!("[stream] configure: {}x{} renderScale=native",
+                              want_dims.0, want_dims.1);
+                    } else {
+                        info!("[stream] configure: {}x{} renderScale={:.3} (kernel target {}x{}; TDS upscale wiring lands next sprint, rendering at display dims for now)",
+                              want_dims.0, want_dims.1, rs, rw, rh);
+                    }
                     // Force renderer rebuild on next tick if rendering.
                     *renderer = None;
                 }
