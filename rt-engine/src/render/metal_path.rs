@@ -138,6 +138,20 @@ pub struct MetalRenderer {
     pub width: u32,
     pub height: u32,
 
+    // Sprint 7.5.6.e -- path-tracing accumulation. Persistent RGBA32F
+    // texture into which each frame's sample contribution gets added.
+    // Output = accum / frame_count. Cleared (= "first frame writes
+    // initial value") by setting self.frame_count to 0 -- the kernel
+    // branches on frame_count == 0 and overwrites instead of reading-
+    // adding-writing.
+    accum_texture: Texture,
+    frame_count: u32,
+    // Tiny per-frame uniform: just the current frame_count (used to
+    // seed RNG + as the denominator for accum averaging). Updated in
+    // place each render_frame via the shared-storage buffer's
+    // contents() pointer; no reallocation per frame.
+    path_state_buffer: Buffer,
+
     // Scene state -- None until the IPC layer pushes a Scene message.
     accel: Option<AccelerationStructure>,
     camera_buffer: Option<Buffer>,
@@ -188,6 +202,26 @@ impl MetalRenderer {
         tex_desc.set_storage_mode(MTLStorageMode::Shared);
         let texture = device.new_texture(&tex_desc);
 
+        // Sprint 7.5.6.e -- accumulation texture for progressive
+        // path tracing. RGBA32F so we can sum many noisy samples
+        // without quantization. Private storage since only the GPU
+        // reads/writes it (no CPU readback).
+        let accum_desc = TextureDescriptor::new();
+        accum_desc.set_width(width as u64);
+        accum_desc.set_height(height as u64);
+        accum_desc.set_pixel_format(MTLPixelFormat::RGBA32Float);
+        accum_desc.set_usage(MTLTextureUsage::ShaderWrite | MTLTextureUsage::ShaderRead);
+        accum_desc.set_storage_mode(MTLStorageMode::Private);
+        let accum_texture = device.new_texture(&accum_desc);
+
+        // Per-frame state uniform (just frame_count for now). Updated
+        // in place each render via the shared buffer's contents()
+        // pointer; no per-frame allocation.
+        let path_state_buffer = device.new_buffer(
+            std::mem::size_of::<u32>() as u64 * 4, // pad to 16 bytes for MSL alignment
+            MTLResourceOptions::StorageModeShared,
+        );
+
         Ok(MetalRenderer {
             device,
             queue,
@@ -195,6 +229,9 @@ impl MetalRenderer {
             texture,
             width,
             height,
+            accum_texture,
+            frame_count: 0,
+            path_state_buffer,
             accel: None,
             camera_buffer: None,
             material_buffer: None,
@@ -208,10 +245,23 @@ impl MetalRenderer {
         })
     }
 
+    /// Reset path-tracing accumulation. Called whenever the scene
+    /// changes (camera move, light tweak, material change, geometry
+    /// rebuild) so we don't average a stale image with a fresh one.
+    /// Doesn't allocate -- just zeroes the frame counter so the
+    /// kernel's "frame_count == 0" branch overwrites accumulation
+    /// instead of reading-adding-writing.
+    pub fn reset_accumulation(&mut self) {
+        self.frame_count = 0;
+    }
+
     /// Apply editor-driven scene state. Rebuilds the acceleration
     /// structure from the new mesh set + uploads the camera uniform
     /// + per-mesh color buffer. Existing scene resources are dropped.
     pub fn update_scene(&mut self, scene: &Scene) -> anyhow::Result<()> {
+        // Any scene change invalidates the path-tracing accumulation
+        // (geometry/camera/lights/materials all changed).
+        self.reset_accumulation();
         log::info!(
             "[metal-renderer] update_scene: {} mesh(es), camera@{:?}, clear={:?}",
             scene.meshes.len(),
@@ -402,8 +452,12 @@ impl MetalRenderer {
     }
 
     /// Update just the camera (cheap; no AS rebuild). Used by Params
-    /// IPC messages for live camera orbit.
+    /// IPC messages for live camera orbit. Resets accumulation since
+    /// the camera move changes which pixels see which world points
+    /// (averaging a static scene through a moving camera = motion
+    /// blur, not what we want).
     pub fn update_camera(&mut self, camera: &Camera) -> anyhow::Result<()> {
+        self.reset_accumulation();
         let cam_uniform = build_camera_uniform(camera, self.width, self.height);
         if let Some(buf) = self.camera_buffer.as_ref() {
             // Shared-storage buffer -- contents() gives a CPU pointer
@@ -425,6 +479,7 @@ impl MetalRenderer {
     /// by Params IPC messages so live-dragging a light's intensity
     /// or hue slider doesn't churn the BVH.
     pub fn update_lights(&mut self, lights: &[Light]) -> anyhow::Result<()> {
+        self.reset_accumulation();
         let uni = build_lights_uniform(lights);
         if let Some(buf) = self.lights_buffer.as_ref() {
             let ptr = buf.contents() as *mut LightsUniform;
@@ -447,6 +502,7 @@ impl MetalRenderer {
     /// length means the mesh set changed and we should be doing a
     /// full update_scene instead (caller decides via signature).
     pub fn update_materials(&mut self, materials: &[Material]) -> anyhow::Result<()> {
+        self.reset_accumulation();
         let Some(buf) = self.material_buffer.as_ref() else {
             return Err(anyhow!("material buffer not yet allocated"));
         };
@@ -594,10 +650,22 @@ impl MetalRenderer {
         let geom_off_buf = self.geom_offsets_buffer.as_ref().unwrap();
         let lights_buf = self.lights_buffer.as_ref().unwrap();
 
+        // Sprint 7.5.6.e -- update per-frame path-tracing state.
+        // path_state_buffer is shared storage so we patch the
+        // contents() pointer directly each frame; no reallocation.
+        // Layout matches the MSL PathState struct: { frame_count, pad
+        // pad, pad } -- the 12 trailing bytes are unused but reserved
+        // for future state (e.g. samples-per-frame, max-bounces).
+        unsafe {
+            let ptr = self.path_state_buffer.contents() as *mut u32;
+            ptr.write(self.frame_count);
+        }
+
         let cb = self.queue.new_command_buffer();
         let enc = cb.new_compute_command_encoder();
         enc.set_compute_pipeline_state(&self.pipeline);
         enc.set_texture(0, Some(&self.texture));
+        enc.set_texture(1, Some(&self.accum_texture));
         enc.set_acceleration_structure(0, Some(&**accel));
         enc.use_resource(&**accel, MTLResourceUsage::Read);
         enc.set_buffer(1, Some(cam_buf), 0);
@@ -606,6 +674,7 @@ impl MetalRenderer {
         enc.set_buffer(4, Some(vidx_buf), 0);
         enc.set_buffer(5, Some(geom_off_buf), 0);
         enc.set_buffer(6, Some(lights_buf), 0);
+        enc.set_buffer(7, Some(&self.path_state_buffer), 0);
 
         let tg_size = MTLSize { width: 16, height: 16, depth: 1 };
         let tg_count = MTLSize {
@@ -617,6 +686,14 @@ impl MetalRenderer {
         enc.end_encoding();
         cb.commit();
         cb.wait_until_completed();
+
+        // Frame counter advances post-render so the next frame uses
+        // the incremented value. Saturate well below 2^24 (the float
+        // mantissa limit the MSL kernel uses when it converts back
+        // to float for the divide) -- at 30 fps this is years of
+        // continuous accumulation; in practice every camera/light
+        // tweak resets us long before that.
+        self.frame_count = self.frame_count.saturating_add(1).min(16_000_000);
 
         let bytes_per_row = (self.width * 4) as u64;
         let mut pixels = vec![0u8; (self.width * self.height * 4) as usize];

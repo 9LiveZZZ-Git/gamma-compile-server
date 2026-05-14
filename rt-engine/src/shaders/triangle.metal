@@ -1,19 +1,29 @@
-// gamma-rt-engine -- sprint 7.5.6.d (refraction + reflection)
+// gamma-rt-engine -- sprint 7.5.6.e (path tracing + GI)
 //
-// Bounce-loop kernel. Mirrors reflect, glass refracts, opaques shade.
-// Up to MAX_BOUNCES (=6) ray bounces per pixel. Each bounce intersects
-// the AS once via the hardware RT cores on Apple9+ silicon.
+// Progressive path tracer with:
+//   - Per-pixel sub-sample jittered primary rays (free AA)
+//   - One bounce + indirect path sample per pixel per frame
+//   - Cosine-weighted hemisphere sampling for diffuse indirect light
+//   - Fresnel-weighted random reflect-or-refract at glass surfaces
+//   - Persistent accumulation texture, output = accum / frame_count
 //
-// Material dispatch (MaterialUniform.flags.x):
-//   0  Unlit   -- just output albedo; terminate path
-//   1  Phong   -- Lambert + Blinn-Phong; terminate path
-//   2  PBR     -- Cook-Torrance + hemisphere IBL; terminate path
-//   3  Mirror  -- perfect reflection ray, multiplicative tint, continue
-//   4  Glass   -- refraction via Snell's law (with TIR fallback to
-//                 reflection), multiplicative absorption tint, continue
+// Convergence: static scenes refine over many frames as noise
+// averages out (target ~64-256 frames for clean GI). Scenes with
+// camera/light/material changes reset the accumulation (engine-side
+// in update_* methods). Denoising lands in sprint f and lets the
+// real-time path look clean at low frame counts.
 //
-// Inputs (unchanged from c-3):
-//   texture(0)/buffer(0..6) as before. LightsUniform unchanged.
+// Buffers (unchanged from c-d except (7) added):
+//   texture(0) RGBA8       -- output (display)
+//   texture(1) RGBA32F     -- accumulation (persistent; private storage)
+//   buffer(0)              -- primitive AS
+//   buffer(1) CameraUniform
+//   buffer(2) MaterialUniform[]
+//   buffer(3) vertex_normals (float4[])
+//   buffer(4) vertex_indices (u32[])
+//   buffer(5) GeomOffset[]
+//   buffer(6) LightsUniform
+//   buffer(7) PathState      -- new; { frame_count, pad×3 }
 
 #include <metal_stdlib>
 #include <metal_raytracing>
@@ -29,9 +39,9 @@ struct CameraUniform {
 };
 
 struct MaterialUniform {
-    float4 albedo;     // .xyz = base color / mirror tint / glass absorption
-    float4 params;     // type-dependent: see kernel
-    uint4  flags;      // .x = type (0=Unlit, 1=Phong, 2=PBR, 3=Mirror, 4=Glass)
+    float4 albedo;
+    float4 params;
+    uint4  flags;
 };
 
 struct GeomOffset {
@@ -55,16 +65,57 @@ struct LightsUniform {
     LightSlot slots[4];
 };
 
+struct PathState {
+    uint frame_count;
+    uint pad0;
+    uint pad1;
+    uint pad2;
+};
+
 constant float PI = 3.14159265358979;
 constant float SHADOW_BIAS = 0.001;
 constant float BOUNCE_BIAS = 0.001;
-constant int   MAX_BOUNCES = 6;
-// Slack threshold for the back-face normal flip. Hits whose dot(N,
-// rd) is in [-THR..THR] are treated as front-face. Without this, the
-// silhouette edge of a mirror ball (where dot ≈ 0) flips spuriously
-// and inverts the reflection direction, producing the "bright top,
-// dark bottom" inversion artifact.
+constant int   MAX_BOUNCES = 4;
 constant float NORMAL_FLIP_THR = 0.05;
+
+// ── RNG (PCG hash + scrambler) ───────────────────────────────────────
+
+inline uint pcg_hash(uint v) {
+    uint state = v * 747796405u + 2891336453u;
+    uint w = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (w >> 22u) ^ w;
+}
+
+inline uint init_rng(uint2 gid, uint frame, uint salt) {
+    // Combine gid + frame + a per-bounce salt so different bounces
+    // get decorrelated samples from the same pixel. PCG-hash twice
+    // for diffusion.
+    uint h = gid.x * 1973u + gid.y * 9277u + frame * 26699u + salt * 71093u;
+    return pcg_hash(pcg_hash(h));
+}
+
+inline float rand01(thread uint& state) {
+    state = pcg_hash(state);
+    return float(state) * (1.0 / 4294967296.0);
+}
+
+// Cosine-weighted hemisphere sample aligned with normal N. Returns a
+// unit-length world-space direction. Cosine weight means samples
+// cluster toward the normal (peaks of Lambert N·L), which matches
+// the BRDF's PDF and cancels out the cos / (1/pi) factors in the
+// throughput multiplier (just multiply by albedo per bounce).
+inline float3 cosine_hemisphere(thread uint& rng, float3 N) {
+    const float u1 = rand01(rng);
+    const float u2 = rand01(rng);
+    const float r = sqrt(u1);
+    const float theta = 2.0 * PI * u2;
+    const float3 local_dir = float3(r * cos(theta), r * sin(theta), sqrt(max(0.0, 1.0 - u1)));
+    // Orthonormal basis around N. Pick T not parallel to N.
+    const float3 T0 = (abs(N.x) > 0.9) ? float3(0, 1, 0) : float3(1, 0, 0);
+    const float3 B = normalize(cross(N, T0));
+    const float3 T = cross(B, N);
+    return local_dir.x * T + local_dir.y * B + local_dir.z * N;
+}
 
 // ── BRDF helpers ─────────────────────────────────────────────────────
 
@@ -82,6 +133,10 @@ inline float schlick_ggx_g1(float NdotX, float roughness) {
 }
 
 inline float3 schlick_fresnel(float cos_theta, float3 F0) {
+    return F0 + (1.0 - F0) * pow(saturate(1.0 - cos_theta), 5.0);
+}
+
+inline float schlick_fresnel_scalar(float cos_theta, float F0) {
     return F0 + (1.0 - F0) * pow(saturate(1.0 - cos_theta), 5.0);
 }
 
@@ -121,10 +176,12 @@ inline LightSample resolve_light(constant LightSlot& slot, float3 hit_point) {
     return s;
 }
 
-// Shade an opaque surface (Unlit / Phong / PBR). Returns the
-// outgoing radiance toward the view direction. Internally fires
-// shadow rays through the same AS via the supplied shadow intersector.
-inline float3 shade_opaque(
+// Direct-only opaque shading: Lambert / Phong / PBR contribution from
+// all lights at this hit point, with shadow rays. Returns the
+// outgoing radiance toward V (the inverse ray direction). The path
+// tracer also fires an indirect cosine-weighted bounce afterward
+// for GI; this function handles just the *direct* term.
+inline float3 shade_direct(
     uint mtype,
     float3 albedo, float metallic, float roughness, float shininess, float ambient_mx,
     float3 N, float3 V, float n_dot_v,
@@ -140,7 +197,7 @@ inline float3 shade_opaque(
     float3 color = float3(0.0);
 
     if (mtype == 1u) {
-        // Phong
+        // Phong direct.
         float3 diffuse = float3(0.0), specular = float3(0.0);
         for (uint i = 0; i < nLights; i++) {
             const LightSample ls = resolve_light(lights.slots[i], hit_point);
@@ -155,11 +212,15 @@ inline float3 shade_opaque(
             const float3 H = normalize(ls.L + V);
             specular += lc * pow(max(0.0, dot(N, H)), max(shininess, 1.0));
         }
+        // Ambient is the analytic fallback for "everything other than
+        // direct + indirect bounce" -- with GI accumulating from the
+        // bounce path, we could shrink this, but it's still useful at
+        // low frame counts for stable shadow-side color.
         const float3 ambient = albedo * ambient_mx
-                             + lights.ambient.xyz * lights.ambient.w * 0.2;
+                             + lights.ambient.xyz * lights.ambient.w * 0.1;
         color = albedo * diffuse + specular + ambient;
     } else {
-        // PBR
+        // PBR direct.
         const float3 F0 = mix(float3(0.04), albedo, metallic);
         float3 Lo = float3(0.0);
         for (uint i = 0; i < nLights; i++) {
@@ -184,6 +245,9 @@ inline float3 shade_opaque(
             const float3 lc = lights.slots[i].color.xyz * lights.slots[i].color.w * ls.attenuation;
             Lo += (kD * albedo / PI + spec) * lc * n_dot_l;
         }
+        // Dim hemisphere-IBL ambient -- path tracing's indirect bounce
+        // gives the "real" indirect light. The IBL term here is a
+        // fallback that gets dialed down once we have proper GI.
         const float3 R = reflect(-V, N);
         const float3 sky_refl = hemisphere_ibl(R);
         const float3 sky_diff = hemisphere_ibl(N);
@@ -191,7 +255,7 @@ inline float3 shade_opaque(
         const float3 amb_kS = amb_F * (1.0 - roughness);
         const float3 amb_kD = (1.0 - amb_F) * (1.0 - metallic);
         const float3 ibl = amb_kD * albedo * sky_diff + amb_kS * sky_refl;
-        color = Lo + ibl * lights.ambient.w;
+        color = Lo + ibl * lights.ambient.w * 0.5;
     }
     return color;
 }
@@ -199,23 +263,30 @@ inline float3 shade_opaque(
 // ── Main kernel ──────────────────────────────────────────────────────
 
 kernel void rt_scene(
-    texture2d<float, access::write> outTex          [[texture(0)]],
-    primitive_acceleration_structure accel          [[buffer(0)]],
+    texture2d<float, access::write>     outTex      [[texture(0)]],
+    texture2d<float, access::read_write> accumTex   [[texture(1)]],
+    primitive_acceleration_structure    accel       [[buffer(0)]],
     constant CameraUniform&  camera                 [[buffer(1)]],
     constant MaterialUniform* materials             [[buffer(2)]],
     constant float4*          vertex_normals        [[buffer(3)]],
     constant uint*            vertex_indices        [[buffer(4)]],
     constant GeomOffset*      geom_offsets          [[buffer(5)]],
     constant LightsUniform&   lights                [[buffer(6)]],
+    constant PathState&       path                  [[buffer(7)]],
     uint2 gid [[thread_position_in_grid]]
 ) {
     const uint w = outTex.get_width();
     const uint h = outTex.get_height();
     if (gid.x >= w || gid.y >= h) return;
 
-    // Initial pixel ray.
-    const float u = (float(gid.x) + 0.5) / float(w);
-    const float v = (float(gid.y) + 0.5) / float(h);
+    const uint frame = path.frame_count;
+    thread uint rng  = init_rng(gid, frame, 0u);
+
+    // Sub-pixel jittered primary ray. Random offset in [0..1] per
+    // pixel per frame gives free AA as the accumulation averages
+    // many jittered samples.
+    const float u = (float(gid.x) + rand01(rng)) / float(w);
+    const float v = (float(gid.y) + rand01(rng)) / float(h);
     const float screen_x = (2.0 * u - 1.0) * camera.misc.x * camera.misc.y;
     const float screen_y = (1.0 - 2.0 * v) * camera.misc.x;
     ray r;
@@ -235,23 +306,17 @@ kernel void rt_scene(
     shadow_isr.accept_any_intersection(true);
 
     float3 throughput = float3(1.0);
-    float3 accum      = float3(0.0);
+    float3 sample     = float3(0.0);
     bool   terminated = false;
 
     for (int bounce = 0; bounce < MAX_BOUNCES; bounce++) {
         intersection_result<triangle_data> hit = isr.intersect(r, accel);
         if (hit.type != intersection_type::triangle) {
-            // Sprint 7.5.6.d follow-up: gradient sky via the same
-            // hemisphere_ibl that the PBR ambient uses. Dark blue
-            // up high, warmer gray near the horizon, dim ground
-            // color when looking down. Free skybox until §5.4
-            // Environments lands a real HDRI probe.
-            accum += throughput * hemisphere_ibl(r.direction);
+            sample += throughput * hemisphere_ibl(r.direction);
             terminated = true;
             break;
         }
 
-        // Hit geometry + smooth normal.
         const float3 hit_point = r.origin + r.direction * hit.distance;
         const uint gid_hit = hit.geometry_id;
         const uint prim    = hit.primitive_id;
@@ -274,12 +339,6 @@ kernel void rt_scene(
         const float2 bary = hit.triangle_barycentric_coord;
         const float bw = 1.0 - bary.x - bary.y;
         float3 N_geom = normalize(bw * n0 + bary.x * n1 + bary.y * n2);
-        // Back-face check with slack so near-tangent hits at the
-        // silhouette of a closed mesh (mirror ball, glass ball)
-        // don't get the normal flipped the wrong way. Editor meshes
-        // produce outward-facing normals consistently; we only flip
-        // when the geometry is CLEARLY a back-face hit (dot well
-        // above zero), not just numerical noise around the equator.
         const float ndotrd = dot(N_geom, r.direction);
         const bool entering = ndotrd < NORMAL_FLIP_THR;
         float3 N = entering ? N_geom : -N_geom;
@@ -288,8 +347,10 @@ kernel void rt_scene(
         const uint mtype = mat.flags.x;
 
         if (mtype == 3u) {
-            // ── Mirror ────────────────────────────────────────────
-            throughput *= mat.albedo.xyz; // tint
+            // Mirror: continue with reflected ray. No direct lighting
+            // contribution at this surface (mirrors don't have a
+            // diffuse term).
+            throughput *= mat.albedo.xyz;
             r.origin    = hit_point + N * BOUNCE_BIAS;
             r.direction = reflect(r.direction, N);
             r.min_distance = 0.0;
@@ -297,30 +358,41 @@ kernel void rt_scene(
             continue;
         }
         if (mtype == 4u) {
-            // ── Glass ─────────────────────────────────────────────
+            // Glass: Fresnel-weighted random branch (reflect or
+            // refract). Path traces correct over many samples.
             const float ior = max(mat.params.x, 1.001);
             const float ior_ratio = entering ? (1.0 / ior) : ior;
+            const float cos_inc = abs(dot(r.direction, N));
+            // F0 for glass dielectric: ((n1-n2)/(n1+n2))^2
+            const float f0_dielectric = (1.0 - ior) / (1.0 + ior);
+            const float F0 = f0_dielectric * f0_dielectric;
+            const float fresnel = schlick_fresnel_scalar(cos_inc, F0);
+
             float3 t = refract(r.direction, N, ior_ratio);
-            if (dot(t, t) < 1e-4) {
-                // Total internal reflection.
+            const bool tir = dot(t, t) < 1e-4;
+            const bool do_reflect = tir || (rand01(rng) < fresnel);
+
+            if (do_reflect) {
                 r.origin    = hit_point + N * BOUNCE_BIAS;
                 r.direction = reflect(r.direction, N);
+                // TIR is energy-preserving; refraction-sampled reflect
+                // already counted by the Fresnel branch -- no extra
+                // multiplier needed because the random pick is
+                // unbiased in expectation.
             } else {
-                // Refraction. Origin biased on the "outgoing" side of
-                // the surface so the next intersect doesn't re-hit
-                // this triangle from the inside.
                 r.origin    = hit_point - N * BOUNCE_BIAS;
                 r.direction = t;
+                // Absorption tint applies on refraction (light enters
+                // / leaves the medium); not on a Fresnel-reflected
+                // bounce (which never entered).
+                throughput *= mat.albedo.xyz;
             }
             r.min_distance = 0.0;
             r.max_distance = 1000.0;
-            // Absorption: tint each bounce. A future c-d.2 could
-            // Beer-Lambert this by distance traveled in the medium.
-            throughput *= mat.albedo.xyz;
             continue;
         }
 
-        // ── Opaque (Unlit / Phong / PBR) ─────────────────────────
+        // ── Opaque (Unlit / Phong / PBR) ──────────────────────────
         const float3 V = -r.direction;
         const float n_dot_v = max(0.0, dot(N, V));
         const float3 albedo    = mat.albedo.xyz;
@@ -329,21 +401,63 @@ kernel void rt_scene(
         const float shininess  = mat.params.z;
         const float ambient_mx = mat.params.w;
 
-        const float3 shade = shade_opaque(
+        // Direct lighting at this hit.
+        const float3 direct = shade_direct(
             mtype, albedo, metallic, roughness, shininess, ambient_mx,
             N, V, n_dot_v, hit_point, accel, shadow_isr, lights
         );
-        accum += throughput * shade;
-        terminated = true;
-        break;
+        sample += throughput * direct;
+
+        // Indirect bounce (Lambertian sample), unless we've used up
+        // the bounce budget. The throughput multiplier for a
+        // cosine-weighted Lambert sample is just `albedo` (cos/pi PDF
+        // cancels with the BRDF normalizer). For PBR materials,
+        // approximating the indirect as diffuse-only is the c-e v1
+        // simplification; the full energy-conserving PBR indirect
+        // sample uses GGX importance sampling, which lands in c-e.2.
+        if (bounce == MAX_BOUNCES - 1) {
+            terminated = true;
+            break;
+        }
+        // Unlit terminates -- no indirect from an emissive flat surface.
+        if (mtype == 0u) {
+            terminated = true;
+            break;
+        }
+        float3 bounce_dir = cosine_hemisphere(rng, N);
+        // Sanity: if cosine sample is degenerate (rare), terminate.
+        if (dot(bounce_dir, N) <= 0.0) {
+            terminated = true;
+            break;
+        }
+        r.origin       = hit_point + N * BOUNCE_BIAS;
+        r.direction    = bounce_dir;
+        r.min_distance = 0.0;
+        r.max_distance = 1000.0;
+        throughput    *= albedo;
+        // (PBR throughput should also account for metallic / specular
+        // split here; c-e v1 approximates by using albedo directly,
+        // which slightly under-bounces metals but stays unbiased for
+        // dielectrics.)
     }
 
     if (!terminated) {
-        // Bounce budget exhausted -- assume the ray escapes to sky.
-        // Prevents the pixel from going pure black on a long mirror
-        // hall of mirrors / inside-glass scenario.
-        accum += throughput * hemisphere_ibl(r.direction);
+        sample += throughput * hemisphere_ibl(r.direction);
     }
 
-    outTex.write(float4(accum, 1.0), gid);
+    // ── Accumulate ───────────────────────────────────────────────────
+    // First frame: write sample as initial value. Subsequent frames:
+    // read prior accum, add, write back. accumTex is RGBA32F so we
+    // don't lose precision summing thousands of samples.
+    float3 new_accum;
+    if (frame == 0u) {
+        new_accum = sample;
+    } else {
+        new_accum = accumTex.read(gid).rgb + sample;
+    }
+    accumTex.write(float4(new_accum, 0.0), gid);
+
+    // Output = average over all frames so far.
+    const float3 avg = new_accum / float(frame + 1u);
+    outTex.write(float4(avg, 1.0), gid);
 }
