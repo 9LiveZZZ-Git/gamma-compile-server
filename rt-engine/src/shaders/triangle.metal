@@ -88,6 +88,16 @@ struct PathState {
     // ray hit within each pixel. Without this they disagree and
     // MetalFX blurs disparate sub-pixel content together.
     float4   jitter;
+    // 5.4-rt -- environment state mirrored from the editor. See the
+    // Rust-side PathStateUniform doc comment for slot semantics.
+    float4   env_params;
+    float4   env_sky;
+    float4   env_horizon;
+    float4   env_ground;
+    float4   env_sun;
+    float4   env_cloud_params;
+    float4   env_fog_params;
+    float4   env_fog_color;
 };
 
 constant float PI = 3.14159265358979;
@@ -291,8 +301,7 @@ inline float3 sample_procedural_sky_features_rt(float3 dir, constant PathState& 
 
     // Stars + Milky Way band (night only, above horizon)
     if (view_y > 0.0f && moon_vis > 0.001f) {
-        const float2 p = floor(dir * 360.0f).xy * 1.0f + floor(dir.z * 360.0f) * float2(0.0f, 7.13f);
-        // Simpler: project on a hashed integer grid using all 3 dims
+        // Hashed integer grid across all 3 direction components.
         const float3 p3 = floor(dir * 360.0f);
         const float h = fract(sin(dot(p3, float3(127.1f, 311.7f, 74.7f))) * 43758.5453f);
         const float star_amt = smoothstep(0.989f, 1.0f, h) * moon_vis;
@@ -511,7 +520,8 @@ inline float3 shade_direct(
     primitive_acceleration_structure accel,
     thread intersector<triangle_data>& shadow_isr,
     constant LightsUniform& lights,
-    thread uint& rng                    // f.3.h -- needed for area-light sampling
+    thread uint& rng,                   // f.3.h -- area-light sampling
+    constant PathState& path            // 5.4-rt -- env state for IBL
 ) {
     if (mtype == 0u) return albedo;
 
@@ -900,7 +910,7 @@ kernel void rt_scene(
         // Direct lighting at this hit.
         const float3 direct = shade_direct(
             mtype, albedo, metallic, roughness, shininess, ambient_mx,
-            N, V, n_dot_v, hit_point, accel, shadow_isr, lights, rng
+            N, V, n_dot_v, hit_point, accel, shadow_isr, lights, rng, path
         );
         sample += throughput * direct;
 
