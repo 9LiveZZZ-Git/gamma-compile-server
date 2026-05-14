@@ -1,15 +1,20 @@
-// gamma-rt-engine -- sprint 7.5.6.c-2
+// gamma-rt-engine -- sprint 7.5.6.c-3
 //
-// Editor-driven scene kernel with smooth normals + material-aware
-// shading. Three BRDFs reachable from the editor's material nodes:
+// Hardware ray-traced scene with shadows + multi-type lights.
 //
-//   Unlit (UnlitMat)     -- output albedo, ignore lighting
-//   Phong (PhongMat)     -- Lambert + Blinn-Phong specular
-//   PBR   (PhysicalMat)  -- Cook-Torrance GGX + Schlick Fresnel +
-//                           Schlick-GGX geometry + hemisphere-IBL
-//                           ambient. Same BRDF as the raster path.
+// Adds to c-2:
+//   - Shadow rays. Every contributing light fires a cheap
+//     "occlusion intersector" toward itself; if anything in the AS
+//     blocks the path, the light contributes nothing for that
+//     pixel. Cost: one extra ray per pixel per visible light, so
+//     N*L rays per pixel total. The hardware RT cores eat this for
+//     breakfast on an Apple M4.
+//   - Point lights. Distance attenuation = (1 - dist/range)^2,
+//     clamped. range from the editor's PointLight node.
+//   - Spot lights. Same distance attenuation + smoothstep cone
+//     falloff between inner_angle and outer_angle.
 //
-// Inputs:
+// Inputs (unchanged from c-2 except LightsUniform layout):
 //   texture(0) -- output RGBA8
 //   buffer(0)  -- primitive AS
 //   buffer(1)  -- CameraUniform
@@ -17,14 +22,7 @@
 //   buffer(3)  -- global vertex_normals (float4 per vertex)
 //   buffer(4)  -- global vertex_indices (u32 per index)
 //   buffer(5)  -- per-mesh GeomOffset[]
-//   buffer(6)  -- LightsUniform
-//
-// c-2 limitations (lifted later):
-//   - Directional lights only. Point + Spot evaluated as no-ops.
-//     Real point/spot in c-3 alongside shadow rays.
-//   - IBL ambient is a procedural hemisphere fake, not a real env
-//     probe. Full HDRI sampling lands in Phase 7 §5.4.
-//   - No shadows. Lit side never gets occluded by other geometry.
+//   buffer(6)  -- LightsUniform (now with per-slot type tag)
 
 #include <metal_stdlib>
 #include <metal_raytracing>
@@ -36,13 +34,13 @@ struct CameraUniform {
     float4 right;
     float4 up;
     float4 forward;
-    float4 misc;        // .x = tan(fov/2), .y = aspect
+    float4 misc;
 };
 
 struct MaterialUniform {
-    float4 albedo;      // .xyz = base color, .w = vertex_mix (unused in c-2)
-    float4 params;      // .x = metallic, .y = roughness, .z = shininess, .w = ambient
-    uint4  flags;       // .x = type (0=Unlit, 1=Phong, 2=PBR)
+    float4 albedo;
+    float4 params;     // .x = metallic, .y = roughness, .z = shininess, .w = ambient
+    uint4  flags;
 };
 
 struct GeomOffset {
@@ -52,18 +50,26 @@ struct GeomOffset {
     uint pad;
 };
 
+// One light slot. Discriminator: flags.x = 0 (dir) / 1 (point) / 2 (spot).
+struct LightSlot {
+    float4 pos_or_dir;   // .xyz = pos (point/spot) or dir-to-light (dir)
+    float4 color;        // .xyz = color, .w = intensity
+    float4 spot_dir;     // .xyz = spot cone axis
+    float4 range_cones;  // .x = range, .y = cos_inner, .z = cos_outer
+    uint4  flags;        // .x = type
+};
+
 struct LightsUniform {
-    float4 ambient;     // .xyz = ambient color, .w = intensity
-    uint4  meta;        // .x = number of directional lights (0..=4)
-    float4 dirs[4];     // .xyz = direction TO light
-    float4 colors[4];   // .xyz = color, .w = intensity
+    float4    ambient;   // .xyz = color, .w = intensity
+    uint4     meta;      // .x = light count
+    LightSlot slots[4];
 };
 
 constant float PI = 3.14159265358979;
+constant float SHADOW_BIAS = 0.001;
 
 // ── BRDF helpers (Cook-Torrance) ─────────────────────────────────────
 
-// GGX / Trowbridge-Reitz normal distribution function.
 inline float ggx_distribution(float NdotH, float roughness) {
     float a  = roughness * roughness;
     float a2 = a * a;
@@ -71,27 +77,65 @@ inline float ggx_distribution(float NdotH, float roughness) {
     return a2 / (PI * denom * denom);
 }
 
-// Schlick-GGX geometry term (one direction).
 inline float schlick_ggx_g1(float NdotX, float roughness) {
     float r = roughness + 1.0;
     float k = (r * r) / 8.0;
     return NdotX / (NdotX * (1.0 - k) + k);
 }
 
-// Schlick Fresnel approximation.
 inline float3 schlick_fresnel(float cos_theta, float3 F0) {
     return F0 + (1.0 - F0) * pow(saturate(1.0 - cos_theta), 5.0);
 }
 
-// Cheap hemisphere IBL: gradient from a horizon ground tone up to a
-// pale-blue sky based on reflection vector's Y. Same shape as the
-// raster path's PBR ambient (which also uses an analytic hemisphere
-// rather than an HDRI for now).
 inline float3 hemisphere_ibl(float3 dir) {
     float t = saturate(0.5 + 0.5 * dir.y);
     float3 sky    = float3(0.55, 0.70, 0.95);
     float3 ground = float3(0.20, 0.18, 0.15);
     return mix(ground, sky, t);
+}
+
+// ── Light evaluation ─────────────────────────────────────────────────
+
+// Resolve the per-light geometry: returns L (unit direction FROM
+// hit point TO light), the distance to the light (used as
+// shadow-ray max), and the geometric attenuation (1 for directional,
+// distance + optional cone falloff for point/spot). attenuation = 0
+// signals "this light contributes nothing here" -- caller should
+// short-circuit before casting the shadow ray.
+struct LightSample {
+    float3 L;
+    float  distance;
+    float  attenuation;
+};
+
+inline LightSample resolve_light(constant LightSlot& slot, float3 hit_point) {
+    LightSample s;
+    const uint type = slot.flags.x;
+    if (type == 0u) {
+        // Directional
+        s.L = slot.pos_or_dir.xyz;
+        s.distance = 1e6;       // effectively infinite for shadow rays
+        s.attenuation = 1.0;
+    } else {
+        // Point or Spot: light at a position
+        float3 to_light = slot.pos_or_dir.xyz - hit_point;
+        s.distance = length(to_light);
+        s.L = (s.distance > 0.0) ? to_light / s.distance : float3(0, 1, 0);
+        // Quadratic falloff to range -- matches the raster path's
+        // attenuation curve. Range = 0 effectively means "no light".
+        float range = slot.range_cones.x;
+        float fade = saturate(1.0 - s.distance / max(range, 0.0001));
+        s.attenuation = fade * fade;
+        if (type == 2u) {
+            // Spot cone falloff. spot_dir is "where the light is shining"
+            // (the axis of the cone), so the angle to the surface point
+            // is between -L and spot_dir.
+            float cos_angle = dot(-s.L, slot.spot_dir.xyz);
+            float spot = smoothstep(slot.range_cones.z, slot.range_cones.y, cos_angle);
+            s.attenuation *= spot;
+        }
+    }
+    return s;
 }
 
 // ── Main kernel ──────────────────────────────────────────────────────
@@ -133,17 +177,16 @@ kernel void rt_scene(
     intersection_result<triangle_data> hit = isr.intersect(r, accel);
 
     if (hit.type != intersection_type::triangle) {
-        // Sky -- dark navy.
         outTex.write(float4(0.05, 0.06, 0.10, 1.0), gid);
         return;
     }
 
+    // Hit point in world space + smooth normal.
+    const float3 hit_point = r.origin + r.direction * hit.distance;
     const uint gid_hit = hit.geometry_id;
     const uint prim    = hit.primitive_id;
     const GeomOffset offs = geom_offsets[gid_hit];
 
-    // Fetch the 3 vertex IDs for the hit triangle. Indexed meshes
-    // look up through vertex_indices; non-indexed use raw primitive*3.
     uint i0, i1, i2;
     if (offs.is_indexed != 0u) {
         const uint base = offs.index_offset + prim * 3u;
@@ -155,78 +198,95 @@ kernel void rt_scene(
         i1 = offs.vertex_offset + prim * 3u + 1u;
         i2 = offs.vertex_offset + prim * 3u + 2u;
     }
-
-    // Smooth-shaded normal via barycentric interpolation of the
-    // three vertex normals. This is the big visual upgrade from c-1
-    // -- a sphere now reads as a smooth surface, not a stack of
-    // discrete facets.
     const float3 n0 = vertex_normals[i0].xyz;
     const float3 n1 = vertex_normals[i1].xyz;
     const float3 n2 = vertex_normals[i2].xyz;
     const float2 bary = hit.triangle_barycentric_coord;
     const float bw = 1.0 - bary.x - bary.y;
     float3 N = normalize(bw * n0 + bary.x * n1 + bary.y * n2);
-
-    // Double-sided shading: flip the normal toward the viewer if
-    // the ray hit the back side (e.g. inside-out winding from an
-    // editor mesh node). Cheaper than tracking winding on the
-    // editor side; same trick c-1 used for flat normals.
     if (dot(N, rd) > 0.0) N = -N;
 
-    const float3 V = -rd; // view direction (toward camera)
+    const float3 V = -rd;
     const float n_dot_v = max(0.0, dot(N, V));
 
     const MaterialUniform mat = materials[gid_hit];
     const float3 albedo = mat.albedo.xyz;
     const uint   mtype  = mat.flags.x;
 
+    // Shadow-ray intersector. accept_any_intersection lets the BVH
+    // traversal early-out on the first hit; we don't care which
+    // primitive shadowed us, just that something did.
+    intersector<triangle_data> shadow_isr;
+    shadow_isr.assume_geometry_type(geometry_type::triangle);
+    shadow_isr.accept_any_intersection(true);
+
+    // Slightly-biased shadow-ray origin to avoid self-shadowing
+    // from the same triangle we just hit. Using the surface normal
+    // (rather than the ray direction) means the bias also handles
+    // grazing-angle ray hits correctly.
+    const float3 shadow_origin = hit_point + N * SHADOW_BIAS;
+
     float3 color = float3(0.0);
+    const uint nLights = lights.meta.x;
 
     if (mtype == 0u) {
-        // ── Unlit ────────────────────────────────────────────────
+        // Unlit: ignore lights entirely.
         color = albedo;
     } else if (mtype == 1u) {
-        // ── Phong (Lambert + Blinn-Phong specular) ───────────────
+        // Phong (Lambert + Blinn-Phong specular).
         const float shininess  = mat.params.z;
         const float ambient_mx = mat.params.w;
 
         float3 diffuse  = float3(0.0);
         float3 specular = float3(0.0);
-        const uint nLights = lights.meta.x;
         for (uint i = 0; i < nLights; i++) {
-            const float3 L = lights.dirs[i].xyz;
-            const float n_dot_l = max(0.0, dot(N, L));
+            const LightSample ls = resolve_light(lights.slots[i], hit_point);
+            if (ls.attenuation <= 0.0) continue;
+            const float n_dot_l = max(0.0, dot(N, ls.L));
             if (n_dot_l <= 0.0) continue;
-            const float3 lc = lights.colors[i].xyz * lights.colors[i].w;
+
+            // Shadow test
+            ray sr;
+            sr.origin       = shadow_origin;
+            sr.direction    = ls.L;
+            sr.min_distance = 0.0;
+            sr.max_distance = ls.distance - SHADOW_BIAS;
+            auto sh = shadow_isr.intersect(sr, accel);
+            if (sh.type == intersection_type::triangle) continue;
+
+            const float3 lc = lights.slots[i].color.xyz
+                            * lights.slots[i].color.w
+                            * ls.attenuation;
             diffuse += lc * n_dot_l;
-            // Blinn-Phong specular -- white highlight, raster path
-            // matches; the editor's PhongMat is a dielectric-only model.
-            const float3 H = normalize(L + V);
+            const float3 H = normalize(ls.L + V);
             const float  spec = pow(max(0.0, dot(N, H)), max(shininess, 1.0));
             specular += lc * spec;
         }
-        // Ambient lifts shadowed areas. Skipping the IBL hemisphere
-        // here -- Phong has its own ambient knob in the material.
         const float3 ambient = albedo * ambient_mx
                              + lights.ambient.xyz * lights.ambient.w * 0.2;
         color = albedo * diffuse + specular + ambient;
     } else {
-        // ── PBR (Cook-Torrance) ──────────────────────────────────
+        // PBR (Cook-Torrance).
         const float metallic  = mat.params.x;
         const float roughness = mat.params.y;
-
-        // F0: dielectric uses 4% reflectance; metals use albedo
-        // tinted specular. Standard Disney-style remap.
         const float3 F0 = mix(float3(0.04), albedo, metallic);
 
         float3 Lo = float3(0.0);
-        const uint nLights = lights.meta.x;
         for (uint i = 0; i < nLights; i++) {
-            const float3 L = lights.dirs[i].xyz;
-            const float n_dot_l = max(0.0, dot(N, L));
+            const LightSample ls = resolve_light(lights.slots[i], hit_point);
+            if (ls.attenuation <= 0.0) continue;
+            const float n_dot_l = max(0.0, dot(N, ls.L));
             if (n_dot_l <= 0.0) continue;
 
-            const float3 H = normalize(L + V);
+            ray sr;
+            sr.origin       = shadow_origin;
+            sr.direction    = ls.L;
+            sr.min_distance = 0.0;
+            sr.max_distance = ls.distance - SHADOW_BIAS;
+            auto sh = shadow_isr.intersect(sr, accel);
+            if (sh.type == intersection_type::triangle) continue;
+
+            const float3 H = normalize(ls.L + V);
             const float n_dot_h = max(0.0, dot(N, H));
             const float v_dot_h = max(0.0, dot(V, H));
 
@@ -237,28 +297,26 @@ kernel void rt_scene(
             const float3 F = schlick_fresnel(v_dot_h, F0);
 
             const float3 spec = (D * G * F) / max(4.0 * n_dot_v * n_dot_l, 1e-4);
-
-            // Energy split: metals have no Lambertian diffuse.
             const float3 kS = F;
             const float3 kD = (1.0 - kS) * (1.0 - metallic);
 
-            const float3 lc = lights.colors[i].xyz * lights.colors[i].w;
+            const float3 lc = lights.slots[i].color.xyz
+                            * lights.slots[i].color.w
+                            * ls.attenuation;
             Lo += (kD * albedo / PI + spec) * lc * n_dot_l;
         }
 
-        // Hemisphere-IBL ambient -- cheap fake env that gives metals
-        // somewhere to reflect even with no real probe. Sample the
-        // reflection vector against the procedural sky/ground gradient.
+        // Hemisphere-IBL ambient -- not shadow-tested for c-3
+        // (would require a hemisphere sample fan; saves for the
+        // path-tracing sprint 7.5.6.e). Surfaces in shadow still
+        // get the IBL contribution, which "looks right" visually.
         const float3 R = reflect(-V, N);
         const float3 sky_refl = hemisphere_ibl(R);
         const float3 sky_diff = hemisphere_ibl(N);
-
         const float3 amb_F  = schlick_fresnel(n_dot_v, F0);
-        const float3 amb_kS = amb_F * (1.0 - roughness); // rough surfaces blur out
+        const float3 amb_kS = amb_F * (1.0 - roughness);
         const float3 amb_kD = (1.0 - amb_F) * (1.0 - metallic);
-
-        const float3 ibl = amb_kD * albedo * sky_diff
-                         + amb_kS * sky_refl;
+        const float3 ibl = amb_kD * albedo * sky_diff + amb_kS * sky_refl;
 
         color = Lo + ibl * lights.ambient.w;
     }

@@ -73,20 +73,41 @@ struct GeomOffset {
     _pad: u32,          // 16-byte total
 }
 
-/// Lights uniform layout matching MSL LightsUniform. Up to 4
-/// directional lights; per-c-1 scope, point/spot lights from the
-/// editor are parsed in scene.rs but skipped here (added in c-2).
+/// One light slot in the uniform. Holds enough data for any of the
+/// three editor-side light types -- the kernel branches on `flags.x`
+/// to pick which fields to read.
+///
+/// Encoding:
+///   flags.x = 0  Directional: pos_or_dir.xyz = direction TO light;
+///                range/cones unused.
+///   flags.x = 1  Point:       pos_or_dir.xyz = world position;
+///                range_cones.x = range (attenuation falls to 0
+///                at this distance), .yz unused, spot_dir unused.
+///   flags.x = 2  Spot:        pos_or_dir.xyz = world position;
+///                range_cones.x = range, .y = cos(inner_angle/2),
+///                .z = cos(outer_angle/2); spot_dir.xyz = cone
+///                axis (direction the spotlight is shining).
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+struct LightSlot {
+    pos_or_dir: [f32; 4],   // .xyz = pos (point/spot) or dir-to-light (dir)
+    color: [f32; 4],        // .xyz = color, .w = intensity
+    spot_dir: [f32; 4],     // .xyz = spot cone axis (where light shines)
+    range_cones: [f32; 4],  // .x = range, .y = cos_inner, .z = cos_outer
+    flags: [u32; 4],        // .x = light type (0=dir, 1=point, 2=spot)
+}
+
+/// Lights uniform: ambient term + up to 4 mixed-type light slots.
+/// MSL matching struct is in triangle.metal.
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
 struct LightsUniform {
     /// .xyz = ambient color, .w = ambient intensity (0..1 typically)
     ambient: [f32; 4],
-    /// .x = number of directional lights (0..=4)
+    /// .x = number of active lights (0..=4)
     meta: [u32; 4],
-    /// `dirs[i].xyz` = direction TO the light (normalized).
-    dirs: [[f32; 4]; 4],
-    /// `colors[i].xyz` = color, `colors[i].w` = intensity.
-    colors: [[f32; 4]; 4],
+    /// Per-light slot data. Slot.flags.x discriminates the type.
+    slots: [LightSlot; 4],
 }
 
 /// Per-mesh build output returned by `build_mesh_buffers`. Holds the
@@ -679,48 +700,86 @@ fn material_to_uniform(m: &Material) -> MaterialUniform {
 /// "sunset-from-up-right" default so shaded scenes aren't pure
 /// ambient (which would look completely flat).
 fn build_lights_uniform(lights: &[Light]) -> LightsUniform {
-    let mut packed: Vec<(Vec3, [f32; 3], f32)> = Vec::new();
+    let mut slots: Vec<LightSlot> = Vec::new();
     for light in lights {
-        if let Light::Directional {
-            direction,
-            color,
-            intensity,
-        } = light
-        {
-            // Editor convention (matches raster path): `direction` is
-            // the direction FROM the surface TOWARD the light source
-            // -- e.g. (0,1,0) means "light directly overhead, rays
-            // shine downward onto surface". For Lambert we use this
-            // vector directly: `dot(N, dirs[i].xyz)`. No CPU negation.
-            let d = Vec3::from(*direction).normalize_or_zero();
-            packed.push((d, *color, *intensity));
-            if packed.len() >= 4 {
-                break;
+        if slots.len() >= 4 { break; }
+        let slot = match light {
+            Light::Directional { direction, color, intensity } => {
+                // Direction TO the light (editor convention).
+                let d = Vec3::from(*direction).normalize_or_zero();
+                LightSlot {
+                    pos_or_dir: [d.x, d.y, d.z, 0.0],
+                    color: [color[0], color[1], color[2], *intensity],
+                    spot_dir: [0.0; 4],
+                    range_cones: [0.0; 4],
+                    flags: [0, 0, 0, 0],
+                }
             }
-        }
-        // c-1: ignore non-directional lights. c-2 adds point/spot
-        // evaluation per-type in the kernel.
-    }
-    if packed.is_empty() {
-        // Default sunlit angle (matches the DirectionalLight node's
-        // registry defaults: upper-right-front, warm white). Looks
-        // fine for any scene with shaded materials wired up.
-        let d = Vec3::new(0.3, 1.0, 0.4).normalize();
-        packed.push((d, [1.0, 0.98, 0.92], 1.0));
+            Light::Point { position, color, intensity, range } => {
+                LightSlot {
+                    pos_or_dir: [position[0], position[1], position[2], 0.0],
+                    color: [color[0], color[1], color[2], *intensity],
+                    spot_dir: [0.0; 4],
+                    range_cones: [range.max(0.001), 0.0, 0.0, 0.0],
+                    flags: [1, 0, 0, 0],
+                }
+            }
+            Light::Spot {
+                position,
+                direction,
+                color,
+                intensity,
+                range,
+                inner_angle_deg,
+                outer_angle_deg,
+            } => {
+                // Spot direction is "where the light shines" --
+                // normalize. cos_inner > cos_outer (smaller angle
+                // = larger cosine). The kernel smoothsteps between
+                // them for the cone falloff.
+                let sd = Vec3::from(*direction).normalize_or_zero();
+                let inner_rad = inner_angle_deg.to_radians() * 0.5;
+                let outer_rad = outer_angle_deg.to_radians() * 0.5;
+                let cos_inner = inner_rad.cos();
+                let cos_outer = outer_rad.cos().min(cos_inner - 1e-4);
+                LightSlot {
+                    pos_or_dir: [position[0], position[1], position[2], 0.0],
+                    color: [color[0], color[1], color[2], *intensity],
+                    spot_dir: [sd.x, sd.y, sd.z, 0.0],
+                    range_cones: [range.max(0.001), cos_inner, cos_outer, 0.0],
+                    flags: [2, 0, 0, 0],
+                }
+            }
+            // Area lights deferred to §5.6.d (refraction sprint).
+            // For c-3 they degrade to "no light contribution".
+            Light::Area { .. } => continue,
+        };
+        slots.push(slot);
     }
 
-    let mut dirs = [[0.0f32; 4]; 4];
-    let mut colors = [[0.0f32; 4]; 4];
-    for (i, (d, c, intensity)) in packed.iter().enumerate() {
-        dirs[i] = [d.x, d.y, d.z, 0.0];
-        colors[i] = [c[0], c[1], c[2], *intensity];
+    if slots.is_empty() {
+        // Default sunlit angle (matches the DirectionalLight node's
+        // registry defaults: upper-right-front, warm white).
+        let d = Vec3::new(0.3, 1.0, 0.4).normalize();
+        slots.push(LightSlot {
+            pos_or_dir: [d.x, d.y, d.z, 0.0],
+            color: [1.0, 0.98, 0.92, 1.0],
+            spot_dir: [0.0; 4],
+            range_cones: [0.0; 4],
+            flags: [0, 0, 0, 0],
+        });
+    }
+
+    let count = slots.len() as u32;
+    // Pad up to 4.
+    while slots.len() < 4 {
+        slots.push(LightSlot::zeroed());
     }
 
     LightsUniform {
         ambient: [0.15, 0.17, 0.20, 1.0],
-        meta: [packed.len() as u32, 0, 0, 0],
-        dirs,
-        colors,
+        meta: [count, 0, 0, 0],
+        slots: [slots[0], slots[1], slots[2], slots[3]],
     }
 }
 
