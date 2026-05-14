@@ -251,6 +251,23 @@ impl TemporalDenoisedScaler {
         }
     }
 
+    /// Color processing mode. Critical for HDR input -- the default
+    /// is `PerceptualLDR (0)` which assumes input is clamped to [0,1]
+    /// and applies the wrong tone-curve assumptions. For our
+    /// RGBA16Float HDR samples (where path-traced values can exceed
+    /// 1.0), set this to `HDR (2)` so MetalFX correctly handles the
+    /// wider range when doing temporal blending.
+    ///
+    /// Values (MTLFXTemporalScalerColorProcessingMode):
+    ///   0 = PerceptualLDR   -- gamma-encoded [0,1] (sRGB-ish)
+    ///   1 = Linear          -- linear [0,1]
+    ///   2 = HDR             -- linear, unbounded (what we want)
+    pub fn set_color_processing_mode(&self, mode: u64) {
+        unsafe {
+            let _: () = msg_send![self.ptr, setColorProcessingMode: mode];
+        }
+    }
+
     /// Encode the denoise + upscale pass into the given command
     /// buffer. All texture properties must have been set first.
     pub fn encode_to_command_buffer(&self, cb: &metal::CommandBufferRef) {

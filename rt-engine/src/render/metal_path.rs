@@ -976,6 +976,12 @@ impl MetalRenderer {
             scaler.set_normal_texture(&self.normal_texture);
             scaler.set_diffuse_albedo_texture(&self.albedo_texture);
             scaler.set_output_texture(&self.metalfx_output_texture);
+            // f.3.d-fix -- color processing mode = HDR (2). Default is
+            // PerceptualLDR (0) which expects [0,1] gamma-encoded; for
+            // our path-traced RGBA16Float HDR samples that's wrong and
+            // causes MetalFX to do conservative temporal blending that
+            // doesn't converge properly on static scenes.
+            scaler.set_color_processing_mode(2);
             // Reset = true on frame 0 after a reset_accumulation so
             // MetalFX drops its temporal history and starts fresh.
             scaler.set_reset(self.frame_count == 0);

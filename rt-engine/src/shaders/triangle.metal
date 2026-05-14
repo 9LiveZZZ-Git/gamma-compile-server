@@ -548,23 +548,28 @@ kernel void rt_scene(
     // color). 0 for sky pixels.
     albedoTex.write(float4(primary_albedo, 1.0), gid);
 
-    // Motion vector: where THIS pixel's content was in the PREVIOUS
-    // frame, in UV-space delta. Zero for:
-    //   - sky pixels (no opaque hit recorded)
-    //   - first frame after accumulation reset (frame == 0): no
-    //     valid history yet, MetalFX should treat as new content.
+    // Motion vector: vector pointing FROM the current pixel TO where
+    // this pixel's content was in the PREVIOUS frame, in UV space.
+    // (Apple's convention: "vector that indicates where in the
+    // previous frame the pixel had been" -> prev - current.)
+    // Zero for sky pixels or the first frame after a reset.
     float2 motion = float2(0.0);
     if (primary_recorded && frame > 0u) {
         const float4 clip_prev = path.prev_view_proj
                                * float4(primary_hit_point, 1.0);
         if (abs(clip_prev.w) > 1e-5) {
-            // NDC = clip / w; UV = NDC * 0.5 + 0.5. Flip Y because
-            // Metal's texture origin is top-left but NDC Y is up.
             float2 ndc_prev = clip_prev.xy / clip_prev.w;
+            // NDC -> UV. Flip Y: Metal texture origin is top-left
+            // (v=0 at top), NDC has Y up (y=1 at top).
             float2 uv_prev  = float2(ndc_prev.x * 0.5 + 0.5,
                                       1.0 - (ndc_prev.y * 0.5 + 0.5));
             float2 uv_cur   = (float2(gid) + 0.5) / float2(float(w), float(h));
-            motion = uv_cur - uv_prev;
+            // f.3.d-fix -- sign was reversed in f.3.b. Apple's docs
+            // are explicit: the motion vector points FROM current TO
+            // previous, so motion = uv_prev - uv_cur. With the wrong
+            // sign MetalFX was reusing history from mirror-image
+            // pixels during orbits.
+            motion = uv_prev - uv_cur;
         }
     }
     motionTex.write(float4(motion.x, motion.y, 0.0, 0.0), gid);
