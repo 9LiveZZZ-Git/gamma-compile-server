@@ -133,6 +133,10 @@ async fn handle_connection(
     let mut renderer: Option<Renderer> = None;
     let mut rendering = false;
     let mut want_dims = (DEFAULT_WIDTH, DEFAULT_HEIGHT);
+    // f.3.g -- desired internal render scale (fraction of want_dims
+    // the kernel actually shades). 1.0 = no upscale. Set by the
+    // Configure handler. Forces renderer rebuild on change.
+    let mut want_render_scale: f32 = 1.0;
     let mut frame_counter: u64 = 0;
     let mut pending_scene: Option<Scene> = None;
     let mut pending_camera: Option<Camera> = None;
@@ -160,6 +164,7 @@ async fn handle_connection(
                     &mut renderer,
                     &mut rendering,
                     &mut want_dims,
+                    &mut want_render_scale,
                     &mut pending_scene,
                     &mut pending_camera,
                 ).await? {
@@ -171,10 +176,21 @@ async fn handle_connection(
                 // Ensure renderer exists at the right dimensions.
                 let need_new = renderer
                     .as_ref()
-                    .map(|r| r.width != want_dims.0 || r.height != want_dims.1)
+                    .map(|r| {
+                        // f.3.g -- rebuild if display dims OR the
+                        // effective render dims drift. Recomputing the
+                        // expected render dims here avoids storing
+                        // render_scale separately on the renderer.
+                        let expected_rw = (((want_dims.0 as f32) * want_render_scale).round() as u32).max(1);
+                        let expected_rh = (((want_dims.1 as f32) * want_render_scale).round() as u32).max(1);
+                        r.width != want_dims.0
+                            || r.height != want_dims.1
+                            || r.render_width != expected_rw
+                            || r.render_height != expected_rh
+                    })
                     .unwrap_or(true);
                 if need_new {
-                    match Renderer::new(want_dims.0, want_dims.1) {
+                    match Renderer::new(want_dims.0, want_dims.1, want_render_scale) {
                         Ok(mut r) => {
                             // Apply any scene / camera state that
                             // arrived BEFORE the renderer was built.
@@ -264,6 +280,7 @@ async fn handle_client_msg(
     renderer: &mut Option<Renderer>,
     rendering: &mut bool,
     want_dims: &mut (u32, u32),
+    want_render_scale: &mut f32,
     pending_scene: &mut Option<Scene>,
     pending_camera: &mut Option<Camera>,
 ) -> anyhow::Result<bool> {
@@ -282,6 +299,7 @@ async fn handle_client_msg(
                 Ok(ClientMsg::Configure { width, height, render_scale }) => {
                     *want_dims = (width.max(1).min(4096), height.max(1).min(4096));
                     let rs = render_scale.clamp(0.25, 1.0);
+                    *want_render_scale = rs;
                     let (rw, rh) = (
                         ((want_dims.0 as f32) * rs).round().max(1.0) as u32,
                         ((want_dims.1 as f32) * rs).round().max(1.0) as u32,
@@ -290,7 +308,7 @@ async fn handle_client_msg(
                         info!("[stream] configure: {}x{} renderScale=native",
                               want_dims.0, want_dims.1);
                     } else {
-                        info!("[stream] configure: {}x{} renderScale={:.3} (kernel target {}x{}; TDS upscale wiring lands next sprint, rendering at display dims for now)",
+                        info!("[stream] configure: {}x{} renderScale={:.3} (kernel at {}x{}; TDS upscale to display dims)",
                               want_dims.0, want_dims.1, rs, rw, rh);
                     }
                     // Force renderer rebuild on next tick if rendering.

@@ -44,11 +44,16 @@ pub type Renderer = metal_path::MetalRenderer;
 pub struct Renderer {
     pub width: u32,
     pub height: u32,
+    // f.3.g -- match the Mac MetalRenderer's surface so ipc.rs can
+    // read these fields generically. Always equals width/height on
+    // the stub (no upscale path here).
+    pub render_width: u32,
+    pub render_height: u32,
 }
 
 #[cfg(not(target_os = "macos"))]
 impl Renderer {
-    pub fn new(_w: u32, _h: u32) -> anyhow::Result<Self> {
+    pub fn new(_w: u32, _h: u32, _render_scale: f32) -> anyhow::Result<Self> {
         Err(anyhow::anyhow!(
             "RT engine streaming requires macOS in part 2c; PC Vulkan-RT support lands in §5.6.b"
         ))

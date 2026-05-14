@@ -199,8 +199,18 @@ pub struct MetalRenderer {
     // both, applies a 5x5 edge-aware spatial filter, writes display.
     denoise_pipeline: ComputePipelineState,
     texture: Texture,
+    /// f.3.g -- DISPLAY (output) dims. What the user sees + what the
+    /// editor receives over WS. `texture` + `metalfx_output_texture`
+    /// live at these dims; the H.264 readback also uses these.
     pub width: u32,
     pub height: u32,
+    /// f.3.g -- RENDER (kernel input) dims. = (width*scale,
+    /// height*scale). The path tracer shades at these dims; the TDS
+    /// scaler upscales kernel output back to (width, height). When
+    /// MetalFX isn't available, render_* == width/height (the
+    /// spatial fallback can't upscale, so we pin scale=1.0).
+    pub render_width: u32,
+    pub render_height: u32,
 
     // Sprint 7.5.6.e -- path-tracing accumulation. Persistent RGBA32F
     // texture into which each frame's sample contribution gets added.
@@ -304,16 +314,79 @@ pub struct MetalRenderer {
 }
 
 impl MetalRenderer {
-    pub fn new(width: u32, height: u32) -> anyhow::Result<Self> {
+    pub fn new(width: u32, height: u32, render_scale: f32) -> anyhow::Result<Self> {
         let device = Device::system_default()
             .ok_or_else(|| anyhow!("MTLCreateSystemDefaultDevice returned null"))?;
 
+        // f.3.g -- compute desired render-dims from display-dims +
+        // scale. ipc.rs clamps render_scale to [0.25, 1.0] before
+        // calling us, but defend here too against direct callers
+        // (render_test_*).
+        //
+        // We probe the MetalFX scaler with these dims BEFORE
+        // allocating textures so that if MetalFX is unavailable we
+        // can fall back to render_width == width (the spatial
+        // denoiser path has no upscale; rendering at sub-display dims
+        // would let the path-tracer write into smaller G-buffers than
+        // the fallback dispatch reads, garbling the output).
+        let requested_scale = render_scale.clamp(0.25, 1.0);
+        let requested_rw    = (((width  as f32) * requested_scale).round() as u32).max(1);
+        let requested_rh    = (((height as f32) * requested_scale).round() as u32).max(1);
+
+        // f.3.g -- probe the MetalFX scaler with the requested
+        // input != output config BEFORE allocating textures. The
+        // probe result decides whether textures get allocated at
+        // (requested_rw, requested_rh) or pinned to (width, height).
+        let probed_scaler = match TemporalDenoisedScaler::try_new(
+            &device,
+            &ScalerConfig {
+                input_width:   requested_rw,
+                input_height:  requested_rh,
+                output_width:  width,
+                output_height: height,
+                ..ScalerConfig::default()
+            },
+        ) {
+            Ok(Some(s)) => Some(s),
+            Ok(None) => {
+                log::warn!(
+                    "[metalfx] TemporalDenoisedScaler not available on this device/OS; \
+                     falling back to spatial denoiser. Requires macOS 15+ and an \
+                     Apple Silicon GPU."
+                );
+                None
+            }
+            Err(e) => {
+                log::warn!("[metalfx] scaler creation threw: {}; falling back", e);
+                None
+            }
+        };
+
+        // f.3.g -- if MetalFX is available we honor render_scale; the
+        // TDS scaler takes care of the upscale to display dims. Without
+        // it, the spatial-denoiser fallback path can't upscale, so we
+        // pin render dims = display dims (full-resolution path-trace)
+        // to keep the pipeline coherent.
+        let (render_width, render_height) = if probed_scaler.is_some() {
+            (requested_rw, requested_rh)
+        } else {
+            (width, height)
+        };
+
         log::info!(
-            "[metal-renderer] device={:?} {}x{} (hardware RT, awaiting scene)",
+            "[metal-renderer] device={:?} display={}x{} render={}x{} scale={:.3} metalfx={}",
             device.name(),
-            width,
-            height
+            width, height,
+            render_width, render_height,
+            requested_scale,
+            if probed_scaler.is_some() { "on" } else { "off (fallback)" },
         );
+        if let Some(s) = probed_scaler.as_ref() {
+            log::info!(
+                "[metalfx] TemporalDenoisedScaler ready: in {}x{} -> out {}x{}",
+                s.input_width, s.input_height, s.output_width, s.output_height
+            );
+        }
 
         let queue = device.new_command_queue();
 
@@ -340,6 +413,10 @@ impl MetalRenderer {
             .new_compute_pipeline_state_with_function(&denoise_func)
             .map_err(|e| anyhow!("denoise pipeline create failed: {}", e))?;
 
+        // f.3.g -- `texture` (CPU readback, H.264 input) + `metalfx_
+        // output_texture` (TDS output) live at DISPLAY dims. The
+        // kernel-side G-buffer + noisy-color textures all live at
+        // RENDER dims (= display dims when render_scale == 1.0).
         let tex_desc = TextureDescriptor::new();
         tex_desc.set_width(width as u64);
         tex_desc.set_height(height as u64);
@@ -351,68 +428,65 @@ impl MetalRenderer {
         // Sprint 7.5.6.e -- accumulation texture for progressive
         // path tracing. RGBA32F so we can sum many noisy samples
         // without quantization. Private storage since only the GPU
-        // reads/writes it (no CPU readback).
+        // reads/writes it (no CPU readback). f.3.g: at render dims.
         let accum_desc = TextureDescriptor::new();
-        accum_desc.set_width(width as u64);
-        accum_desc.set_height(height as u64);
+        accum_desc.set_width(render_width as u64);
+        accum_desc.set_height(render_height as u64);
         accum_desc.set_pixel_format(MTLPixelFormat::RGBA32Float);
         accum_desc.set_usage(MTLTextureUsage::ShaderWrite | MTLTextureUsage::ShaderRead);
         accum_desc.set_storage_mode(MTLStorageMode::Private);
         let accum_texture = device.new_texture(&accum_desc);
 
-        // Sprint 7.5.6.f -- normal G-buffer. f.3.c: format changed
-        // from RGBA32Float to RGBA16Float to match the MetalFX
-        // scaler's normalTextureFormat. 16-bit float is plenty for
-        // normals (15 bits per component = ~1/32k precision, way
-        // more than the [-1, 1] range needs). Saves memory + makes
-        // MetalFX happy.
+        // Sprint 7.5.6.f -- normal G-buffer. f.3.c: RGBA16Float to
+        // match the MetalFX scaler's normalTextureFormat. f.3.g:
+        // sized to render dims (the kernel writes here; TDS reads
+        // here as its normal aux input).
         let normal_desc = TextureDescriptor::new();
-        normal_desc.set_width(width as u64);
-        normal_desc.set_height(height as u64);
+        normal_desc.set_width(render_width as u64);
+        normal_desc.set_height(render_height as u64);
         normal_desc.set_pixel_format(MTLPixelFormat::RGBA16Float);
         normal_desc.set_usage(MTLTextureUsage::ShaderWrite | MTLTextureUsage::ShaderRead);
         normal_desc.set_storage_mode(MTLStorageMode::Private);
         let normal_texture = device.new_texture(&normal_desc);
 
         // Sprint 7.5.6.f.3.b -- depth + motion + albedo G-buffers.
-        // Depth = linear world-space distance from camera to first
-        // opaque hit. Motion = current_uv - prev_uv per pixel. Albedo
-        // = raw surface color before lighting (demodulated).
+        // f.3.g: all at render dims (kernel writes / TDS reads).
         let depth_desc = TextureDescriptor::new();
-        depth_desc.set_width(width as u64);
-        depth_desc.set_height(height as u64);
+        depth_desc.set_width(render_width as u64);
+        depth_desc.set_height(render_height as u64);
         depth_desc.set_pixel_format(MTLPixelFormat::R32Float);
         depth_desc.set_usage(MTLTextureUsage::ShaderWrite | MTLTextureUsage::ShaderRead);
         depth_desc.set_storage_mode(MTLStorageMode::Private);
         let depth_texture = device.new_texture(&depth_desc);
 
         let motion_desc = TextureDescriptor::new();
-        motion_desc.set_width(width as u64);
-        motion_desc.set_height(height as u64);
+        motion_desc.set_width(render_width as u64);
+        motion_desc.set_height(render_height as u64);
         motion_desc.set_pixel_format(MTLPixelFormat::RG16Float);
         motion_desc.set_usage(MTLTextureUsage::ShaderWrite | MTLTextureUsage::ShaderRead);
         motion_desc.set_storage_mode(MTLStorageMode::Private);
         let motion_texture = device.new_texture(&motion_desc);
 
         let albedo_desc = TextureDescriptor::new();
-        albedo_desc.set_width(width as u64);
-        albedo_desc.set_height(height as u64);
+        albedo_desc.set_width(render_width as u64);
+        albedo_desc.set_height(render_height as u64);
         albedo_desc.set_pixel_format(MTLPixelFormat::RGBA8Unorm);
         albedo_desc.set_usage(MTLTextureUsage::ShaderWrite | MTLTextureUsage::ShaderRead);
         albedo_desc.set_storage_mode(MTLStorageMode::Private);
         let albedo_texture = device.new_texture(&albedo_desc);
 
         // Sprint 7.5.6.f.3.c -- noisy single-sample color (path tracer
-        // input to MetalFX) + MetalFX output. Both RGBA16Float so
-        // we don't quantize HDR samples before the temporal blend.
+        // output / MetalFX color input). f.3.g: at render dims.
         let noisy_desc = TextureDescriptor::new();
-        noisy_desc.set_width(width as u64);
-        noisy_desc.set_height(height as u64);
+        noisy_desc.set_width(render_width as u64);
+        noisy_desc.set_height(render_height as u64);
         noisy_desc.set_pixel_format(MTLPixelFormat::RGBA16Float);
         noisy_desc.set_usage(MTLTextureUsage::ShaderWrite | MTLTextureUsage::ShaderRead);
         noisy_desc.set_storage_mode(MTLStorageMode::Private);
         let noisy_color_texture = device.new_texture(&noisy_desc);
 
+        // f.3.g -- TDS output. At DISPLAY dims. Tonemap reads this
+        // and writes the RGBA8 `texture` for H.264 readback.
         let fxout_desc = TextureDescriptor::new();
         fxout_desc.set_width(width as u64);
         fxout_desc.set_height(height as u64);
@@ -421,24 +495,20 @@ impl MetalRenderer {
         fxout_desc.set_storage_mode(MTLStorageMode::Private);
         let metalfx_output_texture = device.new_texture(&fxout_desc);
 
-        // f.3.d-fix4 -- roughness + specular albedo G-buffers,
-        // required auxiliary inputs for the denoised scaler.
-        // Roughness is a single channel in [0,1]; R16Float gives
-        // ~11 bits of mantissa over that range, plenty for the
-        // denoiser's smooth-vs-rough classification. Specular albedo
-        // is per-channel F0, kept at RGBA16F to match the rest of
-        // the HDR pipeline.
+        // f.3.d-fix4 -- roughness + specular albedo G-buffers.
+        // f.3.g: at render dims (TDS aux inputs live with the kernel
+        // they're written by).
         let rough_desc = TextureDescriptor::new();
-        rough_desc.set_width(width as u64);
-        rough_desc.set_height(height as u64);
+        rough_desc.set_width(render_width as u64);
+        rough_desc.set_height(render_height as u64);
         rough_desc.set_pixel_format(MTLPixelFormat::R16Float);
         rough_desc.set_usage(MTLTextureUsage::ShaderWrite | MTLTextureUsage::ShaderRead);
         rough_desc.set_storage_mode(MTLStorageMode::Private);
         let roughness_texture = device.new_texture(&rough_desc);
 
         let spec_desc = TextureDescriptor::new();
-        spec_desc.set_width(width as u64);
-        spec_desc.set_height(height as u64);
+        spec_desc.set_width(render_width as u64);
+        spec_desc.set_height(render_height as u64);
         spec_desc.set_pixel_format(MTLPixelFormat::RGBA16Float);
         spec_desc.set_usage(MTLTextureUsage::ShaderWrite | MTLTextureUsage::ShaderRead);
         spec_desc.set_storage_mode(MTLStorageMode::Private);
@@ -460,42 +530,10 @@ impl MetalRenderer {
             MTLResourceOptions::StorageModeShared,
         );
 
-        // Sprint 7.5.6.f.3.a -- attempt to create the MetalFX scaler.
-        // Returns Ok(None) if the device / OS doesn't support it; we
-        // log + continue with the existing spatial denoiser path in
-        // that case. The dimensions match the current render target.
-        // f.3.b will add the G-buffer outputs the scaler reads; f.3.c
-        // will switch render_frame to use it instead of rt_denoise.
-        let metalfx_scaler = match TemporalDenoisedScaler::try_new(
-            &device,
-            &ScalerConfig {
-                input_width: width,
-                input_height: height,
-                output_width: width,
-                output_height: height,
-                ..ScalerConfig::default()
-            },
-        ) {
-            Ok(Some(s)) => {
-                log::info!(
-                    "[metalfx] TemporalDenoisedScaler ready: in {}x{} -> out {}x{}",
-                    s.input_width, s.input_height, s.output_width, s.output_height
-                );
-                Some(s)
-            }
-            Ok(None) => {
-                log::warn!(
-                    "[metalfx] TemporalDenoisedScaler not available on this device/OS; \
-                     falling back to spatial denoiser for now. Requires macOS 15+ \
-                     and an Apple Silicon GPU."
-                );
-                None
-            }
-            Err(e) => {
-                log::warn!("[metalfx] scaler creation threw: {}; falling back", e);
-                None
-            }
-        };
+        // f.3.g -- metalfx_scaler was probed up front (before texture
+        // allocation) so we could pick the right render_width /
+        // render_height. Just move the option into the struct.
+        let metalfx_scaler = probed_scaler;
 
         Ok(MetalRenderer {
             device,
@@ -505,6 +543,8 @@ impl MetalRenderer {
             texture,
             width,
             height,
+            render_width,
+            render_height,
             accum_texture,
             normal_texture,
             depth_texture,
@@ -1056,13 +1096,22 @@ impl MetalRenderer {
         enc.set_buffer(6, Some(lights_buf), 0);
         enc.set_buffer(7, Some(&self.path_state_buffer), 0);
 
+        // f.3.g -- path-tracing dispatch covers RENDER dims (the
+        // G-buffer + noisy-color textures it writes are render-sized).
+        // The tonemap + spatial-fallback dispatches further down use
+        // a separate display-sized tg_count.
         let tg_size = MTLSize { width: 16, height: 16, depth: 1 };
-        let tg_count = MTLSize {
-            width: ((self.width as u64) + 15) / 16,
+        let tg_count_render = MTLSize {
+            width:  ((self.render_width  as u64) + 15) / 16,
+            height: ((self.render_height as u64) + 15) / 16,
+            depth: 1,
+        };
+        let tg_count_display = MTLSize {
+            width:  ((self.width  as u64) + 15) / 16,
             height: ((self.height as u64) + 15) / 16,
             depth: 1,
         };
-        enc.dispatch_thread_groups(tg_count, tg_size);
+        enc.dispatch_thread_groups(tg_count_render, tg_size);
         enc.end_encoding();
 
         // ── Denoise / display dispatch ────────────────────────────
@@ -1095,10 +1144,13 @@ impl MetalRenderer {
             // Reset = true on frame 0 after a reset_accumulation so
             // MetalFX drops its temporal history and starts fresh.
             scaler.set_reset(self.frame_count == 0);
-            // Motion is stored in UV-space (-1..1). Scale to pixels.
+            // Motion is stored in UV-space (-1..1). Scale to pixels
+            // in the INPUT (render) dim space -- per Apple's TDS docs,
+            // motionVectorScale is in input-texture pixel coordinates,
+            // not output.
             scaler.set_motion_vector_scale(
-                self.width as f32,
-                self.height as f32,
+                self.render_width  as f32,
+                self.render_height as f32,
             );
             // f.3.d / f.3.d-fix4 -- Halton sub-pixel jitter, centered
             // around 0. Kernel samples at (gid + jitter) in [0, 1]
@@ -1118,33 +1170,41 @@ impl MetalRenderer {
             log::debug!(
                 "[metalfx] frame={} reset={} jitter=({:.3},{:.3}) \
                  jitter_mfx=({:.3},{:.3}) motion_scale=({},{}) \
+                 render={}x{} display={}x{} \
                  prev_vp={} depth_reversed=false",
                 self.frame_count,
                 self.frame_count == 0,
                 jitter_x, jitter_y,
                 jitter_x - 0.5, -(jitter_y - 0.5),
+                self.render_width, self.render_height,
+                self.render_width, self.render_height,
                 self.width, self.height,
                 if self.view_proj_history.is_some() { "valid" } else { "identity" },
             );
 
             scaler.encode_to_command_buffer(cb);
 
-            // Tonemap: RGBA16F MetalFX output -> RGBA8 display.
+            // f.3.g -- Tonemap: RGBA16F MetalFX output (display dims)
+            // -> RGBA8 display texture. Dispatched at display dims;
+            // the kernel iterates over output pixels.
             let tm_enc = cb.new_compute_command_encoder();
             tm_enc.set_compute_pipeline_state(&self.tonemap_pipeline);
             tm_enc.set_texture(0, Some(&self.texture));
             tm_enc.set_texture(1, Some(&self.metalfx_output_texture));
-            tm_enc.dispatch_thread_groups(tg_count, tg_size);
+            tm_enc.dispatch_thread_groups(tg_count_display, tg_size);
             tm_enc.end_encoding();
         } else {
-            // Fallback: existing c-f spatial denoiser.
+            // f.3.g -- Spatial-denoise fallback. When metalfx_scaler
+            // is None, render dims == display dims (forced in new()),
+            // so tg_count_render == tg_count_display here and either
+            // works; we use display for clarity.
             let dn_enc = cb.new_compute_command_encoder();
             dn_enc.set_compute_pipeline_state(&self.denoise_pipeline);
             dn_enc.set_texture(0, Some(&self.texture));
             dn_enc.set_texture(1, Some(&self.accum_texture));
             dn_enc.set_texture(2, Some(&self.normal_texture));
             dn_enc.set_buffer(7, Some(&self.path_state_buffer), 0);
-            dn_enc.dispatch_thread_groups(tg_count, tg_size);
+            dn_enc.dispatch_thread_groups(tg_count_display, tg_size);
             dn_enc.end_encoding();
         }
 
@@ -1403,7 +1463,7 @@ const IDENTITY_VIEW_PROJ: [f32; 16] = [
 /// scene (since --render-test is invoked without an IPC client),
 /// render once, save to PNG, exit. Driven by the --render-test CLI.
 pub fn render_test_triangle(width: u32, height: u32, output: &str) -> anyhow::Result<()> {
-    let mut renderer = MetalRenderer::new(width, height)?;
+    let mut renderer = MetalRenderer::new(width, height, 1.0)?;
     renderer.update_scene(&default_test_scene())?;
     let pixels = renderer.render_frame()?;
 
