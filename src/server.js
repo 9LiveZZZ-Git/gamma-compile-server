@@ -11,7 +11,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { compile } from "./compile.js";
 import { startOscBridge } from "./osc-bridge.js";
-import { probeEngine } from "./rt-engine-host.js";
+import { probeEngine, spawnEngine, isPortInUse } from "./rt-engine-host.js";
 import { attachRtProxy } from "./rt-proxy.js";
 
 // Read package version once at startup so /health reports the actual
@@ -86,11 +86,46 @@ export async function startServer({
   // knows whether to enable the RayTracedScene node. Falls through
   // silently if the engine isn't installed (it's optional).
   let rtEngineInfo = null;
+  let rtEngineHandle = null;
+  let rtEngineSpawned = false;
+  const enginePort = 9100;
   try {
     rtEngineInfo = await probeEngine(cacheDir);
+    // Sprint 7.5.6.a part 2h -- auto-spawn. After a successful probe,
+    // try to start the engine as a child process so the user doesn't
+    // need a second terminal. Skip if port is already taken (probably
+    // a manual instance running for dev work).
+    if (rtEngineInfo) {
+      const portBusy = await isPortInUse(enginePort);
+      if (portBusy) {
+        console.log("[rt-engine] port " + enginePort +
+          " already in use; assuming external instance and not spawning");
+      } else {
+        rtEngineHandle = spawnEngine(rtEngineInfo.binary, {
+          port: enginePort,
+          host: "127.0.0.1",
+          backend: "auto"
+        });
+        rtEngineSpawned = true;
+      }
+    }
   } catch (e) {
-    console.warn("[rt-engine] probe threw:", e && e.message);
+    console.warn("[rt-engine] probe/spawn threw:", e && e.message);
   }
+
+  // Clean shutdown -- send SIGTERM to the engine on Ctrl-C so we
+  // don't leave a zombie process owning port 9100. The OSC bridge +
+  // HTTP server close themselves cleanly via process exit; only the
+  // engine subprocess needs explicit teardown.
+  const shutdown = async (sig) => {
+    console.log("\n[server] received " + sig + ", shutting down");
+    if (rtEngineHandle) {
+      await rtEngineHandle.stop();
+    }
+    process.exit(0);
+  };
+  process.once("SIGINT", () => shutdown("SIGINT"));
+  process.once("SIGTERM", () => shutdown("SIGTERM"));
 
   app.get("/health", (req, res) => {
     res.json({
@@ -109,17 +144,20 @@ export async function startServer({
       // Sprint 7.5.6.a part 1 -- RT engine availability. The
       // editor's RayTracedScene node reads this to decide whether
       // to offer RT rendering or fall back to raster Scene.
-      // proxyReady flipped true in part 2d -- the /rt WebSocket
-      // proxy is now attached + can forward to the engine. (User
-      // still has to start the engine binary manually for now;
-      // auto-spawn is a follow-up.)
+      // part 2h -- now also reports whether we auto-spawned the
+      // engine (`spawned: true`) or are leaning on an external
+      // instance (`spawned: false`). Editor uses `enginePort` to
+      // connect direct (bypassing /rt proxy on this server).
       rtEngine: rtEngineInfo
         ? { available: true,
             capabilities: rtEngineInfo.capabilities,
             wsPath: "/rt",
             proxyReady: true,
-            enginePort: 9100 }
-        : { available: false, proxyReady: true, enginePort: 9100 }
+            enginePort,
+            spawned: rtEngineSpawned,
+            pid: rtEngineHandle ? rtEngineHandle.child.pid : null }
+        : { available: false, proxyReady: true, enginePort,
+            spawned: false, pid: null }
     });
   });
 
@@ -171,25 +209,44 @@ export async function startServer({
     console.log(fmtLine("routes compile requests here."));
     console.log(fmtLine(""));
 
-    // Sprint 7.5.6.a part 2d -- /rt WebSocket proxy. Forwards browser
-    // editor traffic to the gamma-rt-engine running on its own local
-    // port (9100 default). User must start the engine manually for
-    // now; the proxy reports a clean error to the editor if the
-    // engine isn't reachable. Same origin policy as the OSC bridge.
+    // Sprint 7.5.6.a part 2d -- /rt WebSocket proxy. Left attached
+    // for production / cross-machine setups, but the editor now
+    // connects directly to ws://127.0.0.1:9100/ (see editor v0.3.64
+    // notes); the proxy hop has unresolved Chrome WS compat issues
+    // and isn't on the critical path for local-Mac dev.
     try {
       attachRtProxy({
         httpServer,
         engineHost: "127.0.0.1",
-        enginePort: 9100,
+        enginePort,
         allowedOrigins,
         allowAnyOrigin: allowAny
       });
-      console.log(fmtLine("RT engine proxy:"));
-      console.log(fmtLine("  ws:    ws://" + displayHost + ":" + port + "/rt"));
-      console.log(fmtLine("  → engine at ws://127.0.0.1:9100/"));
-      console.log(fmtLine(""));
     } catch (e) {
       console.log(fmtLine("⚠ RT proxy attach failed: " + (e && e.message || e)));
+      console.log(fmtLine(""));
+    }
+
+    // Sprint 7.5.6.a part 2h -- RT engine status block. Replaces the
+    // previous "user must start it manually" docs; we now auto-spawn.
+    if (rtEngineInfo) {
+      console.log(fmtLine("RT engine:"));
+      console.log(fmtLine("  binary: " + rtEngineInfo.binary.slice(0, 55)));
+      console.log(fmtLine("  ws:     ws://127.0.0.1:" + enginePort + "/  (editor connects direct)"));
+      if (rtEngineSpawned && rtEngineHandle) {
+        console.log(fmtLine("  status: auto-spawned (pid " + rtEngineHandle.child.pid + ")"));
+      } else {
+        console.log(fmtLine("  status: external (port " + enginePort + " was busy)"));
+      }
+      const c = rtEngineInfo.capabilities;
+      const hwLine = c.metal_rt_hardware ? "Metal-RT hardware" :
+                     c.vulkan_rt        ? "Vulkan-RT"          :
+                                          "compute fallback";
+      console.log(fmtLine("  backend: " + hwLine + " (" + c.gpu_name + ")"));
+      console.log(fmtLine(""));
+    } else {
+      console.log(fmtLine("RT engine: not available"));
+      console.log(fmtLine("  Build it:  cd rt-engine && cargo build --release"));
       console.log(fmtLine(""));
     }
 
