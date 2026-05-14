@@ -67,8 +67,18 @@ struct LightsUniform {
 
 struct PathState {
     uint     frame_count;
-    uint     pad0;
-    uint     pad1;
+    // f.3.d-fix6 -- samples-per-pixel-per-frame. Mapped from the
+    // editor's `quality` preset (1 / 4 / 16) with an optional user
+    // override on the `samples` param. Higher values target edge /
+    // disocclusion noise that TDS history validation can't clear on
+    // its own. CPU clamps to [1, 16] before upload; kernel re-clamps.
+    uint     spp;
+    // f.3.d-fix6 -- max bounce depth, replacing the file-scope
+    // `constant int MAX_BOUNCES = 4` the kernel used pre-fix6.
+    // Mapped from the editor's `quality` preset (2 / 4 / 8) with an
+    // optional user override on the `bounces` param. CPU clamps to
+    // [1, 8] before upload; kernel re-clamps.
+    uint     max_bounces;
     uint     pad2;
     // f.3.b -- previous frame's view*projection matrix.
     float4x4 prev_view_proj;
@@ -83,7 +93,9 @@ struct PathState {
 constant float PI = 3.14159265358979;
 constant float SHADOW_BIAS = 0.001;
 constant float BOUNCE_BIAS = 0.001;
-constant int   MAX_BOUNCES = 4;
+// f.3.d-fix6 -- MAX_BOUNCES moved from file-scope constant into the
+// kernel as a uniform-driven local (see rt_scene below). Editor's
+// `quality` preset drives the value; CPU clamps to [1, 8] on set.
 constant float NORMAL_FLIP_THR = 0.05;
 
 // ── RNG (PCG hash + scrambler) ───────────────────────────────────────
@@ -309,28 +321,33 @@ kernel void rt_scene(
     if (gid.x >= w || gid.y >= h) return;
 
     const uint frame = path.frame_count;
-    thread uint rng  = init_rng(gid, frame, 0u);
+    // f.3.d-fix6 -- samples-per-pixel-per-frame, clamped to a safe
+    // upper bound here so a garbage upload can't lock up the GPU.
+    // 16 is the editor's `final` preset; CPU also clamps to 16.
+    const uint SPP = clamp(path.spp, 1u, 16u);
+    // f.3.d-fix6 -- max bounce depth, replacing the file-scope
+    // `constant int MAX_BOUNCES = 4` the kernel used pre-fix6.
+    // Clamped here too; 8 is the editor's `final` preset ceiling.
+    const uint MAX_BOUNCES = clamp(path.max_bounces, 1u, 8u);
 
     // Sub-pixel jittered primary ray. f.3.d -- one global offset
     // for the entire frame from a Halton(2, 3) sequence (path.jitter
     // .xy in [0, 1]); over many frames this covers the sub-pixel
     // grid uniformly. MetalFX gets the same value (centered to
     // [-0.5, 0.5]) so it can correlate sub-pixel samples across
-    // frames. The kernel's RNG is still used for everything else
-    // (random bounce direction, Fresnel-mixed glass branch).
+    // frames. Per-sample variance comes from the RNG seed (next
+    // line), not from sub-pixel offset -- MetalFX expects ONE jitter
+    // value per frame.
     const float u = (float(gid.x) + path.jitter.x) / float(w);
     const float v = (float(gid.y) + path.jitter.y) / float(h);
     const float screen_x = (2.0 * u - 1.0) * camera.misc.x * camera.misc.y;
     const float screen_y = (1.0 - 2.0 * v) * camera.misc.x;
-    ray r;
-    r.origin       = camera.eye.xyz;
-    r.direction    = normalize(
+    const float3 ray_origin    = camera.eye.xyz;
+    const float3 ray_direction = normalize(
         screen_x * camera.right.xyz
       + screen_y * camera.up.xyz
       + camera.forward.xyz
     );
-    r.min_distance = 0.001;
-    r.max_distance = 1000.0;
 
     intersector<triangle_data> isr;
     isr.assume_geometry_type(geometry_type::triangle);
@@ -338,31 +355,41 @@ kernel void rt_scene(
     shadow_isr.assume_geometry_type(geometry_type::triangle);
     shadow_isr.accept_any_intersection(true);
 
-    float3 throughput = float3(1.0);
-    float3 sample     = float3(0.0);
-    bool   terminated = false;
-
-    // Sprint 7.5.6.f -- track the primary G-buffer values. Recorded
-    // at the FIRST OPAQUE hit (mirror/glass surfaces don't write
-    // their own G-buffer; whatever they ultimately reflect / refract
-    // INTO is the "perceived" content for that pixel). This is
-    // important for temporal denoising in f.3: motion vectors for
-    // mirror reflections track the underlying scene, not the mirror.
+    // G-buffer locals -- written by sample 0 only (because of the
+    // `!primary_recorded` guard inside the bounce loop; once set,
+    // subsequent samples skip the assignment).
     float3 primary_normal     = float3(0.0);
     float3 primary_hit_point  = float3(0.0);
     float3 primary_albedo     = float3(0.0);
-    float  primary_depth      = 0.0;  // total path length to opaque hit
-    // f.3.d-fix4 -- additional G-buffer values required by MetalFX's
-    // denoised scaler. Roughness drives the denoiser's sharpness vs
-    // smoothness decision per pixel; specular albedo (F0) drives the
-    // separation between diffuse and specular paths. Recorded at the
-    // primary OPAQUE hit, same as the rest.
-    float  primary_roughness    = 1.0;  // fully rough default = treat as diffuse
-    float3 primary_specular     = float3(0.04);  // dielectric F0 default
+    float  primary_depth      = 0.0;
+    float  primary_roughness  = 1.0;
+    float3 primary_specular   = float3(0.04);
     bool   primary_recorded   = false;
-    float  accumulated_dist   = 0.0;  // virtual depth through mirrors / glass
 
-    for (int bounce = 0; bounce < MAX_BOUNCES; bounce++) {
+    // Across-samples color accumulator. Each sample's contribution
+    // gets firefly-clamped individually (so one outlier doesn't
+    // dominate the average) then added here. Final color = sum / SPP.
+    float3 sample_accum = float3(0.0);
+
+    for (uint s = 0u; s < SPP; s++) {
+        // Per-sample RNG seed -- decorrelated across both pixels and
+        // samples within a frame, plus across frames.
+        thread uint rng  = init_rng(gid, frame * 16u + s, 0u);
+
+        // Re-init the ray each sample because the bounce loop
+        // mutates r.origin / r.direction.
+        ray r;
+        r.origin       = ray_origin;
+        r.direction    = ray_direction;
+        r.min_distance = 0.001;
+        r.max_distance = 1000.0;
+
+        float3 throughput = float3(1.0);
+        float3 sample     = float3(0.0);
+        bool   terminated = false;
+        float  accumulated_dist   = 0.0;  // virtual depth through mirrors / glass
+
+    for (uint bounce = 0u; bounce < MAX_BOUNCES; bounce++) {
         intersection_result<triangle_data> hit = isr.intersect(r, accel);
         if (hit.type != intersection_type::triangle) {
             sample += throughput * hemisphere_ibl(r.direction);
@@ -529,7 +556,7 @@ kernel void rt_scene(
         // approximating the indirect as diffuse-only is the c-e v1
         // simplification; the full energy-conserving PBR indirect
         // sample uses GGX importance sampling, which lands in c-e.2.
-        if (bounce == MAX_BOUNCES - 1) {
+        if (bounce == MAX_BOUNCES - 1u) {
             terminated = true;
             break;
         }
@@ -555,9 +582,20 @@ kernel void rt_scene(
         // dielectrics.)
     }
 
-    if (!terminated) {
-        sample += throughput * hemisphere_ibl(r.direction);
-    }
+        if (!terminated) {
+            sample += throughput * hemisphere_ibl(r.direction);
+        }
+
+        // f.3.d -- firefly clamp PER SAMPLE before averaging into the
+        // cross-sample accumulator. Doing it per-sample (rather than
+        // on the average) means one wild outlier from a glass / mirror
+        // path doesn't get smeared across the other samples.
+        sample_accum += min(sample, float3(8.0));
+    }  // end SPP loop
+
+    // f.3.d-fix6 -- mean across SPP samples. With SPP=1 this is just
+    // the single sample; with SPP=2 we've halved per-frame variance.
+    const float3 final_sample = sample_accum / float(SPP);
 
     // ── Accumulate (kept for spatial-denoise fallback) ───────────────
     // First frame: write sample as initial value. Subsequent frames:
@@ -566,22 +604,16 @@ kernel void rt_scene(
     // need this -- it consumes the noisy single-sample texture below.
     float3 new_accum;
     if (frame == 0u) {
-        new_accum = sample;
+        new_accum = final_sample;
     } else {
-        new_accum = accumTex.read(gid).rgb + sample;
+        new_accum = accumTex.read(gid).rgb + final_sample;
     }
     accumTex.write(float4(new_accum, 0.0), gid);
 
-    // f.3.c -- noisy single-sample color for MetalFX.
-    // f.3.d -- firefly clamp before output. Glass / mirror paths
-    // occasionally produce single super-bright samples (caustics,
-    // edge-of-TIR cases). Without clamping, these stick around in
-    // MetalFX's temporal blend for many frames and look like
-    // sparkly artifacts. min() to a reasonable HDR ceiling keeps
-    // the unbiased average correct in expectation while killing
-    // the worst outliers.
-    const float3 clamped_sample = min(sample, float3(8.0));
-    noisyColorTex.write(float4(clamped_sample, 1.0), gid);
+    // f.3.c -- noisy single-sample color for MetalFX. (Clamping was
+    // done per-sample inside the SPP loop, so we just write the mean
+    // directly here.)
+    noisyColorTex.write(float4(final_sample, 1.0), gid);
 
     // ── G-buffer writes ───────────────────────────────────────────
     // Normal: .xyz = world-space normal at primary opaque hit, .w =

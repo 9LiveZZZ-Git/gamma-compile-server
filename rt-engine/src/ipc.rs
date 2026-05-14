@@ -370,6 +370,29 @@ async fn handle_client_msg(
                             }
                         }
                     }
+                    // f.3.d-fix6 -- quality patch. Accepts a sub-
+                    // object with optional fields so we can extend
+                    // (denoise toggle, etc) without changing the
+                    // schema. Editor resolves the `quality` preset
+                    // (draft / preview / final) to these concrete
+                    // values per RAYTRACING.md §5.6.g:
+                    //   draft    spp=1,  bounces=2
+                    //   preview  spp=4,  bounces=4
+                    //   final    spp=16, bounces=8
+                    // Either field is optional; missing fields keep
+                    // the previous renderer state.
+                    if let Some(q_val) = patch.get("quality") {
+                        if let Some(spp_val) = q_val.get("spp").and_then(|v| v.as_u64()) {
+                            if let Some(r) = renderer.as_mut() {
+                                r.set_spp(spp_val as u32);
+                            }
+                        }
+                        if let Some(b_val) = q_val.get("bounces").and_then(|v| v.as_u64()) {
+                            if let Some(r) = renderer.as_mut() {
+                                r.set_bounces(b_val as u32);
+                            }
+                        }
+                    }
                 }
                 Ok(ClientMsg::RenderStart) => {
                     *rendering = true;

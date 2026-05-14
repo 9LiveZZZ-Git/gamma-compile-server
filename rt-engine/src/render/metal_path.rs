@@ -52,16 +52,31 @@ struct CameraUniform {
 /// render so the kernel sees the latest values without a fresh
 /// allocation.
 ///
-/// Layout (80 bytes total):
-///   offset 0..3   frame_count: u32
-///   offset 4..15  pad: 3× u32 (to keep float4x4 at offset 16,
-///                  which Metal requires for 16-byte alignment)
-///   offset 16..79 prev_view_proj: column-major float4x4 (4×16 bytes)
+/// Layout (96 bytes total):
+///   offset  0..3   frame_count: u32
+///   offset  4..7   spp: u32              (f.3.d-fix6)
+///   offset  8..11  max_bounces: u32      (f.3.d-fix6)
+///   offset 12..15  pad: 1× u32
+///   offset 16..79  prev_view_proj: column-major float4x4
+///   offset 80..95  jitter: float4
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
 struct PathStateUniform {
     frame_count: u32,
-    _pad: [u32; 3],
+    /// f.3.d-fix6 -- samples-per-pixel-per-frame. Set via the
+    /// `quality` patch on a Params message. Editor resolves the
+    /// `quality` preset to {1, 4, 16}; users can override [1, 16].
+    /// Kernel clamps to [1, 16] for safety regardless of what we
+    /// upload. Higher values target edge / disocclusion noise that
+    /// TDS history validation can't clear on its own.
+    spp: u32,
+    /// f.3.d-fix6 -- max ray-tracing recursion depth. Set via the
+    /// `quality` patch on a Params message. Editor resolves the
+    /// `quality` preset to {2, 4, 8}; users can override [1, 8].
+    /// Kernel clamps to [1, 8] for safety. Replaces the file-scope
+    /// `constant int MAX_BOUNCES = 4` the shader used pre-fix6.
+    max_bounces: u32,
+    _pad: [u32; 1],
     prev_view_proj: [[f32; 4]; 4],
     /// Sprint 7.5.6.f.3.d -- per-frame global sub-pixel jitter.
     /// .xy = Halton(2,3) sequence value in [0, 1]. The kernel uses
@@ -256,6 +271,17 @@ pub struct MetalRenderer {
     current_view_proj: Option<[f32; 16]>,
     view_proj_history: Option<[f32; 16]>,
     frame_count: u32,
+    /// f.3.d-fix6 -- samples-per-pixel-per-frame. Updated via the
+    /// "quality" patch on Params messages. Clamped to [1, 16] on set.
+    /// Default 1 to match pre-f.3.d-fix6 behavior; the editor's
+    /// RayTracedScene node defaults to the "preview" preset (4 spp).
+    spp: u32,
+    /// f.3.d-fix6 -- max bounce depth for the path tracer. Updated
+    /// via the "quality" patch on Params messages. Clamped to [1, 8]
+    /// on set. Default 4 to match the pre-fix6 `MAX_BOUNCES` constant
+    /// the shader used; editor's RayTracedScene defaults to 4 via the
+    /// "preview" preset.
+    bounces: u32,
     // Tiny per-frame uniform: just the current frame_count (used to
     // seed RNG + as the denominator for accum averaging). Updated in
     // place each render_frame via the shared-storage buffer's
@@ -493,6 +519,8 @@ impl MetalRenderer {
             current_view_proj: None,
             view_proj_history: None,
             frame_count: 0,
+            spp: 1,
+            bounces: 4,
             path_state_buffer,
             accel: None,
             camera_buffer: None,
@@ -522,6 +550,42 @@ impl MetalRenderer {
     pub fn reset_accumulation(&mut self) {
         self.frame_count = 0;
         self.view_proj_history = None;
+    }
+
+    /// f.3.d-fix6 -- samples per pixel per frame. Mapped from the
+    /// editor's `quality` preset (1 / 4 / 16) plus an optional user
+    /// override on the `samples` param. Clamped here to [1, 16] so a
+    /// stray upload can't pin the GPU on a 1000-spp dispatch.
+    ///
+    /// Changing SPP also resets accumulation since the per-frame
+    /// noise distribution changes character (more samples = lower
+    /// variance), and we don't want the running accumulation texture
+    /// to blend pre/post-change samples with mismatched magnitudes.
+    pub fn set_spp(&mut self, spp: u32) {
+        let new_spp = spp.clamp(1, 16);
+        if new_spp != self.spp {
+            log::info!("[metal-renderer] spp {} -> {}", self.spp, new_spp);
+            self.spp = new_spp;
+            self.reset_accumulation();
+        }
+    }
+
+    /// f.3.d-fix6 -- max ray-tracing recursion depth (bounce budget).
+    /// Mapped from the editor's `quality` preset (2 / 4 / 8) plus an
+    /// optional user override on the `bounces` param. Clamped to
+    /// [1, 8] -- the path tracer can't do more without the per-bounce
+    /// RNG salt schedule overflowing.
+    ///
+    /// Changing the bounce budget invalidates the path-tracing
+    /// accumulation (different bounce count = different mean radiance
+    /// per pixel), so we reset like set_spp does.
+    pub fn set_bounces(&mut self, bounces: u32) {
+        let new_b = bounces.clamp(1, 8);
+        if new_b != self.bounces {
+            log::info!("[metal-renderer] bounces {} -> {}", self.bounces, new_b);
+            self.bounces = new_b;
+            self.reset_accumulation();
+        }
     }
 
     /// Apply editor-driven scene state. Rebuilds the acceleration
@@ -950,7 +1014,9 @@ impl MetalRenderer {
         let jitter_y = halton(3, halton_idx);
         let path_state = PathStateUniform {
             frame_count: self.frame_count,
-            _pad: [0; 3],
+            spp: self.spp,
+            max_bounces: self.bounces,
+            _pad: [0; 1],
             prev_view_proj: pvp_cols,
             jitter: [jitter_x, jitter_y, 0.0, 0.0],
         };
