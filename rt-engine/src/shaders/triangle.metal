@@ -97,6 +97,15 @@ constant float BOUNCE_BIAS = 0.001;
 // kernel as a uniform-driven local (see rt_scene below). Editor's
 // `quality` preset drives the value; CPU clamps to [1, 8] on set.
 constant float NORMAL_FLIP_THR = 0.05;
+// f.3.h-fix1 -- per-primary-ray Monte-Carlo sample count for area
+// lights. Each primary fires this many shadow rays into each area
+// light slot and averages. 1 = old behavior (relies entirely on TDS
+// for penumbra smoothing -> grainy in motion); 4 = solid trade-off,
+// the penumbra reads as a smooth gradient even in motion; 8+ =
+// render-grade. Cost scales linearly per area light per bounce, so
+// keep this tight at preview presets. Non-area lights ignore this
+// (loop runs once for them).
+constant uint AREA_SAMPLES_PER_LIGHT = 4u;
 
 // ── RNG (PCG hash + scrambler) ───────────────────────────────────────
 
@@ -259,17 +268,29 @@ inline float3 shade_direct(
         // Phong direct.
         float3 diffuse = float3(0.0), specular = float3(0.0);
         for (uint i = 0; i < nLights; i++) {
-            const LightSample ls = resolve_light(lights.slots[i], hit_point, rng);
-            if (ls.attenuation <= 0.0) continue;
-            const float n_dot_l = max(0.0, dot(N, ls.L));
-            if (n_dot_l <= 0.0) continue;
-            ray sr; sr.origin = shadow_origin; sr.direction = ls.L;
-            sr.min_distance = 0.0; sr.max_distance = ls.distance - SHADOW_BIAS;
-            if (shadow_isr.intersect(sr, accel).type == intersection_type::triangle) continue;
-            const float3 lc = lights.slots[i].color.xyz * lights.slots[i].color.w * ls.attenuation;
-            diffuse += lc * n_dot_l;
-            const float3 H = normalize(ls.L + V);
-            specular += lc * pow(max(0.0, dot(N, H)), max(shininess, 1.0));
+            // f.3.h-fix1 -- area lights take N samples per primary
+            // ray to flatten penumbra MC noise. Other light types
+            // are deterministic; the inner loop runs once for them.
+            const uint ltype = lights.slots[i].flags.x;
+            const uint samples = (ltype == 3u) ? AREA_SAMPLES_PER_LIGHT : 1u;
+            float3 li_diffuse = float3(0.0);
+            float3 li_specular = float3(0.0);
+            for (uint a = 0u; a < samples; a++) {
+                const LightSample ls = resolve_light(lights.slots[i], hit_point, rng);
+                if (ls.attenuation <= 0.0) continue;
+                const float n_dot_l = max(0.0, dot(N, ls.L));
+                if (n_dot_l <= 0.0) continue;
+                ray sr; sr.origin = shadow_origin; sr.direction = ls.L;
+                sr.min_distance = 0.0; sr.max_distance = ls.distance - SHADOW_BIAS;
+                if (shadow_isr.intersect(sr, accel).type == intersection_type::triangle) continue;
+                const float3 lc = lights.slots[i].color.xyz * lights.slots[i].color.w * ls.attenuation;
+                li_diffuse += lc * n_dot_l;
+                const float3 H = normalize(ls.L + V);
+                li_specular += lc * pow(max(0.0, dot(N, H)), max(shininess, 1.0));
+            }
+            const float inv_s = 1.0 / float(samples);
+            diffuse  += li_diffuse  * inv_s;
+            specular += li_specular * inv_s;
         }
         // Ambient is the analytic fallback for "everything other than
         // direct + indirect bounce" -- with GI accumulating from the
@@ -283,26 +304,35 @@ inline float3 shade_direct(
         const float3 F0 = mix(float3(0.04), albedo, metallic);
         float3 Lo = float3(0.0);
         for (uint i = 0; i < nLights; i++) {
-            const LightSample ls = resolve_light(lights.slots[i], hit_point, rng);
-            if (ls.attenuation <= 0.0) continue;
-            const float n_dot_l = max(0.0, dot(N, ls.L));
-            if (n_dot_l <= 0.0) continue;
-            ray sr; sr.origin = shadow_origin; sr.direction = ls.L;
-            sr.min_distance = 0.0; sr.max_distance = ls.distance - SHADOW_BIAS;
-            if (shadow_isr.intersect(sr, accel).type == intersection_type::triangle) continue;
-            const float3 H = normalize(ls.L + V);
-            const float n_dot_h = max(0.0, dot(N, H));
-            const float v_dot_h = max(0.0, dot(V, H));
-            const float D  = ggx_distribution(n_dot_h, roughness);
-            const float Gv = schlick_ggx_g1(max(n_dot_v, 1e-4), roughness);
-            const float Gl = schlick_ggx_g1(n_dot_l, roughness);
-            const float G  = Gv * Gl;
-            const float3 F = schlick_fresnel(v_dot_h, F0);
-            const float3 spec = (D * G * F) / max(4.0 * n_dot_v * n_dot_l, 1e-4);
-            const float3 kS = F;
-            const float3 kD = (1.0 - kS) * (1.0 - metallic);
-            const float3 lc = lights.slots[i].color.xyz * lights.slots[i].color.w * ls.attenuation;
-            Lo += (kD * albedo / PI + spec) * lc * n_dot_l;
+            // f.3.h-fix1 -- area lights take N samples per primary
+            // ray to flatten penumbra MC noise. Other light types
+            // are deterministic; the inner loop runs once for them.
+            const uint ltype = lights.slots[i].flags.x;
+            const uint samples = (ltype == 3u) ? AREA_SAMPLES_PER_LIGHT : 1u;
+            float3 li_Lo = float3(0.0);
+            for (uint a = 0u; a < samples; a++) {
+                const LightSample ls = resolve_light(lights.slots[i], hit_point, rng);
+                if (ls.attenuation <= 0.0) continue;
+                const float n_dot_l = max(0.0, dot(N, ls.L));
+                if (n_dot_l <= 0.0) continue;
+                ray sr; sr.origin = shadow_origin; sr.direction = ls.L;
+                sr.min_distance = 0.0; sr.max_distance = ls.distance - SHADOW_BIAS;
+                if (shadow_isr.intersect(sr, accel).type == intersection_type::triangle) continue;
+                const float3 H = normalize(ls.L + V);
+                const float n_dot_h = max(0.0, dot(N, H));
+                const float v_dot_h = max(0.0, dot(V, H));
+                const float D  = ggx_distribution(n_dot_h, roughness);
+                const float Gv = schlick_ggx_g1(max(n_dot_v, 1e-4), roughness);
+                const float Gl = schlick_ggx_g1(n_dot_l, roughness);
+                const float G  = Gv * Gl;
+                const float3 F = schlick_fresnel(v_dot_h, F0);
+                const float3 spec = (D * G * F) / max(4.0 * n_dot_v * n_dot_l, 1e-4);
+                const float3 kS = F;
+                const float3 kD = (1.0 - kS) * (1.0 - metallic);
+                const float3 lc = lights.slots[i].color.xyz * lights.slots[i].color.w * ls.attenuation;
+                li_Lo += (kD * albedo / PI + spec) * lc * n_dot_l;
+            }
+            Lo += li_Lo * (1.0 / float(samples));
         }
         // Dim hemisphere-IBL ambient -- path tracing's indirect bounce
         // gives the "real" indirect light. The IBL term here is a
