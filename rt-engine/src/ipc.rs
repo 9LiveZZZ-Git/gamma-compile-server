@@ -439,6 +439,36 @@ async fn handle_client_msg(
                             }
                         }
                     }
+                    // 5.4-rt -- env patch. Editor mirrors its raster
+                    // Scene's env uniform into 8 vec4s and ships them
+                    // here. Each field is optional; missing slots
+                    // keep the previous value engine-side. mode 0
+                    // (no env wired) is the default + matches pre-
+                    // 5.4-rt hemisphere_ibl behavior exactly.
+                    if let Some(env_val) = patch.get("env") {
+                        let g4 = |k: &str, fallback: [f32; 4]| -> [f32; 4] {
+                            env_val.get(k).and_then(|v| v.as_array())
+                                .map(|a| [
+                                    a.get(0).and_then(|v| v.as_f64()).unwrap_or(fallback[0] as f64) as f32,
+                                    a.get(1).and_then(|v| v.as_f64()).unwrap_or(fallback[1] as f64) as f32,
+                                    a.get(2).and_then(|v| v.as_f64()).unwrap_or(fallback[2] as f64) as f32,
+                                    a.get(3).and_then(|v| v.as_f64()).unwrap_or(fallback[3] as f64) as f32,
+                                ])
+                                .unwrap_or(fallback)
+                        };
+                        if let Some(r) = renderer.as_mut() {
+                            r.set_env(
+                                g4("params",      [0.0, 1.0, 1.0, 0.76]),
+                                g4("sky",         [0.0; 4]),
+                                g4("horizon",     [0.0; 4]),
+                                g4("ground",      [0.0; 4]),
+                                g4("sun",         [0.0, 1.0, 0.0, 0.0]),
+                                g4("cloudParams", [0.0; 4]),
+                                g4("fogParams",   [0.0; 4]),
+                                g4("fogColor",    [0.65, 0.70, 0.78, 0.0]),
+                            );
+                        }
+                    }
                 }
                 Ok(ClientMsg::RenderStart) => {
                     *rendering = true;

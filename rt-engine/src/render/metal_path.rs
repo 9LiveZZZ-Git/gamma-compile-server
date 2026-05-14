@@ -52,13 +52,21 @@ struct CameraUniform {
 /// render so the kernel sees the latest values without a fresh
 /// allocation.
 ///
-/// Layout (96 bytes total):
-///   offset  0..3   frame_count: u32
-///   offset  4..7   spp: u32              (f.3.d-fix6)
-///   offset  8..11  max_bounces: u32      (f.3.d-fix6)
-///   offset 12..15  pad: 1× u32
-///   offset 16..79  prev_view_proj: column-major float4x4
-///   offset 80..95  jitter: float4
+/// Layout (224 bytes total):
+///   offset   0..3   frame_count: u32
+///   offset   4..7   spp: u32              (f.3.d-fix6)
+///   offset   8..11  max_bounces: u32      (f.3.d-fix6)
+///   offset  12..15  pad: 1× u32
+///   offset  16..79  prev_view_proj: column-major float4x4
+///   offset  80..95  jitter: float4
+///   offset  96..111 env_params: float4    (5.4-rt -- mode/intensity/turbidity/mieG)
+///   offset 112..127 env_sky:    float4    (.rgb + moonPhase)
+///   offset 128..143 env_horizon:float4
+///   offset 144..159 env_ground: float4
+///   offset 160..175 env_sun:    float4    (dir TO sun + visibility)
+///   offset 176..191 env_cloud_params: float4 (coverage/density/windX/windZ)
+///   offset 192..207 env_fog_params:   float4 (density/start/hFall/autoEnv)
+///   offset 208..223 env_fog_color:    float4 (rgb)
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
 struct PathStateUniform {
@@ -86,6 +94,28 @@ struct PathStateUniform {
     /// it can correlate this frame's hits with the prior frame's
     /// hits across sub-pixel positions.
     jitter: [f32; 4],
+    /// 5.4-rt -- environment state mirrored from the editor's
+    /// per-Scene env uniform. Replaces the kernel's pre-5.4-rt
+    /// hemisphere_ibl() everywhere a sky / ambient sample was
+    /// needed. Set via `env` field on a params patch.
+    ///   env_params       : .x mode (0=hemisphere fallback, 1=GradientSky,
+    ///                    2=ProceduralSky, 3=HDRI not yet supported)
+    ///                    .y intensity, .z turbidity, .w mieG
+    ///   env_sky          : .rgb + .w moonPhase
+    ///   env_horizon      : .rgb
+    ///   env_ground       : .rgb
+    ///   env_sun          : .xyz dir TO sun, .w visibility
+    ///   env_cloud_params : .x coverage, .y density, .z windX, .w windZ
+    ///   env_fog_params   : .x density, .y start, .z heightFalloff, .w autoEnv
+    ///   env_fog_color    : .rgb manual fog color (when autoEnv = 0)
+    env_params: [f32; 4],
+    env_sky: [f32; 4],
+    env_horizon: [f32; 4],
+    env_ground: [f32; 4],
+    env_sun: [f32; 4],
+    env_cloud_params: [f32; 4],
+    env_fog_params: [f32; 4],
+    env_fog_color: [f32; 4],
 }
 
 /// Halton sequence in base `b`, for index `i`. Returns a low-
@@ -299,6 +329,19 @@ pub struct MetalRenderer {
     /// the shader used; editor's RayTracedScene defaults to 4 via the
     /// "preview" preset.
     bounces: u32,
+    /// 5.4-rt -- environment / sky state mirrored from the editor.
+    /// Replaces the kernel's pre-5.4-rt hemisphere_ibl() everywhere
+    /// a sky / ambient sample was needed. Default is mode 0
+    /// (hemisphere fallback) so scenes without a wired environment
+    /// look the same as pre-5.4-rt.
+    env_params:       [f32; 4],
+    env_sky:          [f32; 4],
+    env_horizon:      [f32; 4],
+    env_ground:       [f32; 4],
+    env_sun:          [f32; 4],
+    env_cloud_params: [f32; 4],
+    env_fog_params:   [f32; 4],
+    env_fog_color:    [f32; 4],
     // Tiny per-frame uniform: just the current frame_count (used to
     // seed RNG + as the denominator for accum averaging). Updated in
     // place each render_frame via the shared-storage buffer's
@@ -572,6 +615,18 @@ impl MetalRenderer {
             frame_count: 0,
             spp: 1,
             bounces: 4,
+            // 5.4-rt -- env defaults to mode 0 (hemisphere fallback) so
+            // scenes without a wired environment look the same as
+            // pre-5.4-rt. The editor sends real env data via params
+            // patch when a GradientSky / ProceduralSky is wired.
+            env_params:       [0.0, 1.0, 1.0, 0.76], // mode 0, intensity 1
+            env_sky:          [0.0; 4],
+            env_horizon:      [0.0; 4],
+            env_ground:       [0.0; 4],
+            env_sun:          [0.0, 1.0, 0.0, 0.0],
+            env_cloud_params: [0.0; 4],
+            env_fog_params:   [0.0; 4],
+            env_fog_color:    [0.65, 0.70, 0.78, 0.0],
             path_state_buffer,
             accel: None,
             camera_buffer: None,
@@ -637,6 +692,33 @@ impl MetalRenderer {
             self.bounces = new_b;
             self.reset_accumulation();
         }
+    }
+
+    /// 5.4-rt -- update environment / sky state. Called when the
+    /// editor ships an `env` patch. Each vec4 is stored as-is; the
+    /// kernel reads them from PathStateUniform on the next render.
+    /// Resets accumulation so a sudden env change doesn't bleed into
+    /// the TDS history.
+    pub fn set_env(
+        &mut self,
+        params:       [f32; 4],
+        sky:          [f32; 4],
+        horizon:      [f32; 4],
+        ground:       [f32; 4],
+        sun:          [f32; 4],
+        cloud_params: [f32; 4],
+        fog_params:   [f32; 4],
+        fog_color:    [f32; 4],
+    ) {
+        self.env_params       = params;
+        self.env_sky          = sky;
+        self.env_horizon      = horizon;
+        self.env_ground       = ground;
+        self.env_sun          = sun;
+        self.env_cloud_params = cloud_params;
+        self.env_fog_params   = fog_params;
+        self.env_fog_color    = fog_color;
+        self.reset_accumulation();
     }
 
     /// Apply editor-driven scene state. Rebuilds the acceleration
@@ -1070,6 +1152,14 @@ impl MetalRenderer {
             _pad: [0; 1],
             prev_view_proj: pvp_cols,
             jitter: [jitter_x, jitter_y, 0.0, 0.0],
+            env_params:       self.env_params,
+            env_sky:          self.env_sky,
+            env_horizon:      self.env_horizon,
+            env_ground:       self.env_ground,
+            env_sun:          self.env_sun,
+            env_cloud_params: self.env_cloud_params,
+            env_fog_params:   self.env_fog_params,
+            env_fog_color:    self.env_fog_color,
         };
         unsafe {
             let ptr = self.path_state_buffer.contents() as *mut PathStateUniform;

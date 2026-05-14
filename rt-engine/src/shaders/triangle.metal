@@ -174,6 +174,261 @@ inline float3 hemisphere_ibl(float3 dir) {
     return mix(float3(0.20, 0.18, 0.15), float3(0.55, 0.70, 0.95), t);
 }
 
+// ── 5.4-rt environment sampling (ported from editor WGSL) ────────────
+// Modes mirror the editor's sample_env mode dispatch:
+//   0 = hemisphere fallback (matches pre-5.4-rt look exactly)
+//   1 = GradientSky: 3-stop top/horizon/ground gradient
+//   2 = ProceduralSky: physics-based Rayleigh+Mie scattering
+//   3 = HDRI: not yet supported on RT (needs texture binding;
+//             separate sprint). Falls back to mode 0.
+
+constant float3 SKY_BETA_R     = float3(0.030, 0.070, 0.170);
+constant float  SKY_PATH_SCALE = 4.0;
+
+inline float _sky_optical_depth(float cos_zenith) {
+    return 1.0 / max(cos_zenith + 0.05, 0.08);
+}
+
+inline float3 _sky_sun_extinction(float sunCosZenith, float turbidity) {
+    float depth = _sky_optical_depth(sunCosZenith);
+    float3 betaM = float3(0.030) * turbidity;
+    return exp(-(SKY_BETA_R + betaM) * depth * SKY_PATH_SCALE);
+}
+
+// Smooth physics-based atmosphere (no point features). Suitable for
+// IBL ambient + secondary bounces; high-frequency disk/moon/stars
+// land in _features only.
+inline float3 sample_procedural_sky_smooth_rt(float3 dir, constant PathState& path) {
+    const float3 sunDir    = path.env_sun.xyz;
+    const float  sunVis    = path.env_sun.w;
+    const float  turbidity = path.env_params.z;
+    const float  mieG      = path.env_params.w;
+    const float  intensity = path.env_params.y;
+    const float  view_y    = clamp(dir.y, -1.0f, 1.0f);
+    const float  sun_elev  = clamp(sunDir.y, -1.0f, 1.0f);
+    const float  day       = smoothstep(-0.08f, 0.18f, sun_elev);
+
+    const float3 betaR = SKY_BETA_R;
+    const float3 betaM = float3(0.030) * turbidity;
+    const float cos_theta = clamp(dot(dir, sunDir), -1.0f, 1.0f);
+    const float cos2 = cos_theta * cos_theta;
+
+    const float phaseR = 0.0596f * (1.0f + cos2);
+    const float g  = clamp(mieG, 0.0f, 0.95f);
+    const float g2 = g * g;
+    const float phaseM_denom = pow(max(1.0f + g2 - 2.0f * g * cos_theta, 1e-4f), 1.5f);
+    const float phaseM = 0.119f * (1.0f - g2) * (1.0f + cos2) / ((2.0f + g2) * phaseM_denom);
+
+    const float sunDepth  = _sky_optical_depth(max(sun_elev, -0.05f));
+    const float viewDepth = _sky_optical_depth(max(view_y, 0.0f));
+    const float3 extinction = exp(-(betaR + betaM) * sunDepth * SKY_PATH_SCALE);
+    const float3 sunRadiance = float3(1.5f, 1.4f, 1.3f) * extinction;
+
+    const float3 viewExt = exp(-(betaR + betaM) * viewDepth * SKY_PATH_SCALE * 0.6f);
+    const float3 inR = sunRadiance * betaR * phaseR;
+    const float3 inM = sunRadiance * betaM * phaseM;
+    float3 sky_day = (inR + inM) * (float3(1.0f) - viewExt) * 80.0f;
+
+    // Multi-scatter ambient (mimics 2+ bounces among air molecules
+    // that single-scattering misses, so the sky stays blue-everywhere
+    // at noon instead of dimming away from the sun).
+    const float3 multiScatter = float3(0.18f, 0.42f, 0.92f) *
+                                smoothstep(-0.05f, 0.35f, sun_elev) *
+                                (float3(1.0f) - viewExt);
+    sky_day = sky_day + multiScatter * 1.4f;
+
+    const float3 zen_night = float3(0.015f, 0.022f, 0.060f);
+    const float3 hor_night = float3(0.045f, 0.050f, 0.095f);
+    const float3 sky_night = mix(hor_night, zen_night, smoothstep(0.0f, 1.0f, max(view_y, 0.0f)));
+
+    const float3 ground_day   = float3(0.18f, 0.13f, 0.10f);
+    const float3 ground_night = float3(0.010f, 0.012f, 0.025f);
+    const float3 ground = mix(ground_night, ground_day, day);
+
+    float3 col = mix(sky_night, sky_day, day);
+    if (view_y < 0.0f) col = ground;
+
+    const float halo = phaseM * sunVis * 1.0f;
+    col = col + halo * sunRadiance;
+
+    return col * intensity;
+}
+
+// High-frequency features: sun disk, moon (with phase), star field,
+// Milky Way band. Sky-pass-only -- aliases through smooth normals
+// if used in IBL.
+inline float _hash21_rt(float2 p) {
+    return fract(sin(dot(p, float2(127.1f, 311.7f))) * 43758.5453f);
+}
+inline float3 sample_procedural_sky_features_rt(float3 dir, constant PathState& path) {
+    const float3 sunDir    = path.env_sun.xyz;
+    const float  sunVis    = path.env_sun.w;
+    const float  turbidity = path.env_params.z;
+    const float  intensity = path.env_params.y;
+    const float  moonPhase = path.env_sky.w;
+    const float  view_y    = clamp(dir.y, -1.0f, 1.0f);
+    const float  sun_elev  = clamp(sunDir.y, -1.0f, 1.0f);
+    const float  day       = smoothstep(-0.08f, 0.18f, sun_elev);
+    const float  night     = 1.0f - day;
+
+    float3 col = float3(0.0f);
+
+    // Sun disk + atmospheric-extinction color
+    const float cos_theta = clamp(dot(dir, sunDir), -1.0f, 1.0f);
+    const float disk = smoothstep(0.99988f, 0.99996f, cos_theta) * sunVis * 14.0f;
+    const float3 sunExt = _sky_sun_extinction(max(sun_elev, -0.05f), turbidity);
+    const float3 sunDiskColor = sunExt * float3(2.2f, 2.0f, 1.8f);
+    col = col + disk * sunDiskColor;
+
+    // Moon (opposite the sun; phase modulates brightness)
+    const float3 moonDir = -sunDir;
+    const float cos_moon = clamp(dot(dir, moonDir), -1.0f, 1.0f);
+    const float moon_vis = clamp(night, 0.0f, 1.0f);
+    const float phaseLit = sin(clamp(moonPhase, 0.0f, 1.0f) * 3.14159265f);
+    const float moon_disk = smoothstep(0.99988f, 0.99996f, cos_moon) * moon_vis * 5.0f * phaseLit;
+    const float moon_halo = smoothstep(0.985f, 0.9999f, cos_moon)    * moon_vis * 0.05f * phaseLit;
+    col = col + (moon_disk + moon_halo) * float3(0.92f, 0.95f, 1.00f);
+
+    // Stars + Milky Way band (night only, above horizon)
+    if (view_y > 0.0f && moon_vis > 0.001f) {
+        const float2 p = floor(dir * 360.0f).xy * 1.0f + floor(dir.z * 360.0f) * float2(0.0f, 7.13f);
+        // Simpler: project on a hashed integer grid using all 3 dims
+        const float3 p3 = floor(dir * 360.0f);
+        const float h = fract(sin(dot(p3, float3(127.1f, 311.7f, 74.7f))) * 43758.5453f);
+        const float star_amt = smoothstep(0.989f, 1.0f, h) * moon_vis;
+        const float temp_h = fract(sin(dot(p3, float3(89.3f, 47.7f, 31.1f))) * 76123.4f);
+        float3 starColor;
+        if (temp_h < 0.5f) {
+            starColor = mix(float3(0.62f, 0.78f, 1.00f),
+                            float3(1.00f, 0.98f, 0.95f),
+                            smoothstep(0.0f, 0.5f, temp_h));
+        } else {
+            starColor = mix(float3(1.00f, 0.98f, 0.95f),
+                            float3(1.00f, 0.72f, 0.45f),
+                            smoothstep(0.5f, 1.0f, temp_h));
+        }
+        const float twinkle = 0.55f + 0.45f * fract(sin(dot(p3, float3(19.7f, 41.3f, 7.1f))) * 12345.6f);
+        col = col + starColor * star_amt * twinkle * 1.4f;
+
+        const float3 galacticAxis = normalize(float3(0.45f, 0.55f, 0.70f));
+        const float bandDist = fabs(dot(dir, galacticAxis));
+        const float bandIntensity = smoothstep(0.35f, 0.05f, bandDist);
+        const float nhash = fract(sin(dot(floor(dir * 24.0f), float3(17.3f, 91.2f, 53.5f))) * 8194.7f);
+        const float bandTex = 0.45f + 0.55f * nhash;
+        col = col + float3(0.22f, 0.20f, 0.32f) * bandIntensity * bandTex * moon_vis * 0.65f;
+    }
+
+    return col * intensity;
+}
+
+// 2D noise + fbm for clouds (ported from WGSL).
+inline float _cloud_noise2d(float2 p) {
+    const float2 i = floor(p);
+    const float2 f = fract(p);
+    const float2 u = f * f * (3.0f - 2.0f * f);
+    const float a = _hash21_rt(i);
+    const float b = _hash21_rt(i + float2(1.0f, 0.0f));
+    const float c = _hash21_rt(i + float2(0.0f, 1.0f));
+    const float d = _hash21_rt(i + float2(1.0f, 1.0f));
+    return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+}
+inline float _cloud_fbm(float2 p) {
+    float v = 0.0f;
+    float amp = 0.5f;
+    float freq = 1.0f;
+    for (int i = 0; i < 5; i++) {
+        v += amp * _cloud_noise2d(p * freq);
+        freq *= 2.07f;
+        amp  *= 0.5f;
+    }
+    return v;
+}
+
+inline float4 sample_clouds_rt(float3 dir, constant PathState& path) {
+    const float coverage = path.env_cloud_params.x;
+    const float density  = path.env_cloud_params.y;
+    if (coverage <= 0.0f || density <= 0.0f) return float4(0.0f);
+    const float yMask = smoothstep(0.0f, 0.12f, dir.y);
+    if (yMask <= 0.0f) return float4(0.0f);
+    const float H = 250.0f;
+    const float t = H / max(dir.y, 0.02f);
+    const float3 pos = dir * t;
+    const float2 wind = path.env_cloud_params.zw;
+    const float2 xz = (pos.xz - wind) * 0.0025f;
+    const float raw = _cloud_fbm(xz);
+    const float alpha = smoothstep(coverage * 0.85f, coverage * 0.85f + 0.22f, raw) * density * yMask;
+    const float cos_theta = clamp(dot(normalize(dir), path.env_sun.xyz), -1.0f, 1.0f);
+    const float scatter = pow(max(cos_theta * 0.5f + 0.5f, 0.0f), 2.0f);
+    const float sun_elev = clamp(path.env_sun.y, -1.0f, 1.0f);
+    const float3 lit = mix(float3(1.10f, 0.85f, 0.65f),
+                           float3(1.05f, 1.02f, 0.98f),
+                           smoothstep(0.0f, 0.35f, sun_elev));
+    const float3 shadow = float3(0.35f, 0.40f, 0.50f);
+    const float day = smoothstep(-0.10f, 0.20f, sun_elev);
+    const float3 cloudCol = mix(shadow, lit, scatter * path.env_sun.w) * day;
+    return float4(cloudCol, clamp(alpha, 0.0f, 0.95f));
+}
+
+// Mode-dispatched env sample. Smooth-only (no features) -- suitable
+// for IBL ambient + secondary bounces. RT engine doesn't yet support
+// HDRI texture (mode 3); falls back to hemisphere.
+inline float3 sample_env_smooth_rt(float3 dir, constant PathState& path) {
+    const uint mode = (uint)path.env_params.x;
+    if (mode == 1u) {
+        const float t = clamp(dir.y, -1.0f, 1.0f);
+        const float intensity = path.env_params.y;
+        if (t > 0.0f) {
+            return mix(path.env_horizon.rgb, path.env_sky.rgb,    smoothstep(0.0f, 1.0f, t)) * intensity;
+        } else {
+            return mix(path.env_horizon.rgb, path.env_ground.rgb, smoothstep(0.0f, 1.0f, -t)) * intensity;
+        }
+    }
+    if (mode == 2u) {
+        return sample_procedural_sky_smooth_rt(dir, path);
+    }
+    return hemisphere_ibl(dir);
+}
+
+// Full env sample (smooth + features + clouds). Use for primary-ray
+// miss (the sky background visible to the camera); secondary
+// bounces stick with sample_env_smooth_rt to avoid feature aliasing.
+inline float3 sample_env_full_rt(float3 dir, constant PathState& path) {
+    const uint mode = (uint)path.env_params.x;
+    float3 col = sample_env_smooth_rt(dir, path);
+    if (mode == 2u) {
+        col = col + sample_procedural_sky_features_rt(dir, path);
+        const float4 cloud = sample_clouds_rt(dir, path);
+        col = mix(col, cloud.rgb, cloud.a);
+    }
+    return col;
+}
+
+// Distance fog. Mirrors the editor's apply_fog: Beer-Lambert over
+// (dist - start) with optional ground-fog height falloff. Fog color
+// is the env-horizon (autoEnv=1, projects camera ray to y=0) or a
+// manual rgb.
+inline float3 apply_fog_rt(float3 color, float3 worldPos, float3 eye, float3 camForward, constant PathState& path) {
+    const float density = path.env_fog_params.x;
+    if (density <= 0.0f) return color;
+    const float start = path.env_fog_params.y;
+    const float hf    = path.env_fog_params.z;
+    const float dist  = length(eye - worldPos);
+    const float beyond = max(dist - start, 0.0f);
+    float heightFactor = 1.0f;
+    if (hf > 0.0f) {
+        heightFactor = smoothstep(hf * 2.0f, 0.0f, worldPos.y);
+    }
+    const float factor = 1.0f - exp(-density * beyond * heightFactor);
+    float3 fogCol;
+    if (path.env_fog_params.w > 0.5f) {
+        const float3 horiz = normalize(float3(camForward.x, 0.0f, camForward.z) + float3(1e-4f, 0.0f, 0.0f));
+        fogCol = sample_env_smooth_rt(horiz, path);
+    } else {
+        fogCol = path.env_fog_color.rgb;
+    }
+    return mix(color, fogCol, clamp(factor, 0.0f, 1.0f));
+}
+
 // ── Light evaluation ─────────────────────────────────────────────────
 
 struct LightSample {
@@ -338,8 +593,12 @@ inline float3 shade_direct(
         // gives the "real" indirect light. The IBL term here is a
         // fallback that gets dialed down once we have proper GI.
         const float3 R = reflect(-V, N);
-        const float3 sky_refl = hemisphere_ibl(R);
-        const float3 sky_diff = hemisphere_ibl(N);
+        // 5.4-rt -- IBL ambient via wired env (mode 0 = hemisphere
+        // fallback, matches pre-5.4-rt look exactly). Smooth-only
+        // sampler -- features (sun disk / stars / etc) would alias
+        // through smooth surface normals.
+        const float3 sky_refl = sample_env_smooth_rt(R, path);
+        const float3 sky_diff = sample_env_smooth_rt(N, path);
         const float3 amb_F  = schlick_fresnel(n_dot_v, F0);
         const float3 amb_kS = amb_F * (1.0 - roughness);
         const float3 amb_kD = (1.0 - amb_F) * (1.0 - metallic);
@@ -478,7 +737,17 @@ kernel void rt_scene(
     for (uint bounce = 0u; bounce < MAX_BOUNCES; bounce++) {
         intersection_result<triangle_data> hit = isr.intersect(r, accel);
         if (hit.type != intersection_type::triangle) {
-            sample += throughput * hemisphere_ibl(r.direction);
+            // 5.4-rt -- env-aware sky color for miss rays. Primary
+            // miss (bounce == 0) uses the full env including sun disk,
+            // moon, stars, Milky Way + clouds (= what the camera sees
+            // as the visible sky background). Secondary miss uses
+            // smooth-only so features don't alias through reflected /
+            // refracted ray directions.
+            if (bounce == 0u) {
+                sample += throughput * sample_env_full_rt(r.direction, path);
+            } else {
+                sample += throughput * sample_env_smooth_rt(r.direction, path);
+            }
             terminated = true;
             break;
         }
@@ -669,9 +938,23 @@ kernel void rt_scene(
     }
 
         if (!terminated) {
-            sample += throughput * hemisphere_ibl(r.direction);
+            // 5.4-rt -- post-bounce-budget miss. Always smooth-only
+            // (the ray has bounced at least once; features would
+            // alias).
+            sample += throughput * sample_env_smooth_rt(r.direction, path);
         }
 
+        // 5.4-rt -- distance fog (atmospheric perspective). Applied
+        // only when the primary ray hit geometry; sky pixels are
+        // already env-horizon-tinted so no extra fog mix needed.
+        // Per-pixel ray_direction projected to the horizon plane
+        // (inside apply_fog_rt) gives each pixel its OWN horizon
+        // color -- actually more realistic atmospheric perspective
+        // than the editor's uniform camera-forward sample.
+        if (primary_recorded) {
+            sample = apply_fog_rt(sample, primary_hit_point,
+                                  camera.eye.xyz, ray_direction, path);
+        }
         // f.3.d -- firefly clamp PER SAMPLE before averaging into the
         // cross-sample accumulator. Doing it per-sample (rather than
         // on the average) means one wild outlier from a glass / mirror
