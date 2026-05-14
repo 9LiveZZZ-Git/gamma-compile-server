@@ -26,7 +26,7 @@
 use crate::backend::BackendKind;
 use crate::capability::Capabilities;
 use crate::render::Renderer;
-use crate::scene::{Camera, Scene};
+use crate::scene::{Camera, Light, Scene};
 use anyhow::Context;
 use futures_util::{SinkExt, StreamExt};
 use log::{info, warn};
@@ -309,12 +309,11 @@ async fn handle_client_msg(
                     }
                 }
                 Ok(ClientMsg::Params { patch }) => {
-                    // Sprint 7.5.6.a part 2e-1 -- partial update.
-                    // Currently the only patch field supported is
-                    // "camera" (for live orbit / pose changes that
-                    // shouldn't trigger an AS rebuild). Other fields
-                    // ignored silently for now; 2e-2 expands the
-                    // coverage to per-mesh transforms + materials.
+                    // Partial update path. Patch fields handled in
+                    // c-1: "camera" (live orbit), "lights" (live
+                    // intensity / hue drags). Anything else is
+                    // silently ignored -- mesh transforms + per-
+                    // material partial updates come in 2e-2 / c-2.
                     if let Some(cam_val) = patch.get("camera") {
                         match serde_json::from_value::<Camera>(cam_val.clone()) {
                             Ok(cam) => {
@@ -328,6 +327,24 @@ async fn handle_client_msg(
                             }
                             Err(e) => {
                                 warn!("[stream] camera-params parse failed: {}", e);
+                            }
+                        }
+                    }
+                    if let Some(lights_val) = patch.get("lights") {
+                        match serde_json::from_value::<Vec<Light>>(lights_val.clone()) {
+                            Ok(lights) => {
+                                if let Some(r) = renderer.as_mut() {
+                                    if let Err(e) = r.update_lights(&lights) {
+                                        warn!("[stream] update_lights failed: {}", e);
+                                    }
+                                }
+                                // If renderer isn't built yet, the
+                                // next Scene message will include
+                                // lights anyway -- no pending_lights
+                                // state needed.
+                            }
+                            Err(e) => {
+                                warn!("[stream] lights-params parse failed: {}", e);
                             }
                         }
                     }

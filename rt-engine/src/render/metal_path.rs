@@ -25,7 +25,8 @@ use metal::{
 };
 use std::ffi::c_void;
 
-use crate::scene::{Camera, GeometryRef, Material, MeshInstance, Scene};
+use crate::scene::{Camera, GeometryRef, Light, Material, MeshInstance, Scene};
+use glam::Vec3;
 
 const KERNEL_SRC: &str = include_str!("../shaders/triangle.metal");
 
@@ -49,6 +50,43 @@ struct PrimitiveColor {
     color: [f32; 4], // .xyz = RGB, .w = unused
 }
 
+/// Per-geometry offset into the global per-primitive normals buffer.
+/// The kernel does `flat_normals[geom_offsets[geom_id].triangle_offset
+/// + primitive_id]` to fetch the hit triangle's flat normal.
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+struct GeomOffset {
+    triangle_offset: u32, // index into flat_normals[] for this geometry's first triangle
+    _pad: [u32; 3],       // 16-byte alignment for the buffer
+}
+
+/// Lights uniform layout matching MSL LightsUniform. Up to 4
+/// directional lights; per-c-1 scope, point/spot lights from the
+/// editor are parsed in scene.rs but skipped here (added in c-2).
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+struct LightsUniform {
+    /// .xyz = ambient color, .w = ambient intensity (0..1 typically)
+    ambient: [f32; 4],
+    /// .x = number of directional lights (0..=4)
+    meta: [u32; 4],
+    /// `dirs[i].xyz` = direction TO the light (normalized).
+    dirs: [[f32; 4]; 4],
+    /// `colors[i].xyz` = color, `colors[i].w` = intensity.
+    colors: [[f32; 4]; 4],
+}
+
+/// Per-mesh build output returned by `build_mesh_buffers`. Holds the
+/// GPU buffers the AS needs (positions + optional indices) AND the
+/// CPU-side flat-normals vector that we'll concatenate into the
+/// global normals buffer used by the kernel for Lambert shading.
+struct MeshBuildResult {
+    position_buffer: Buffer,
+    index_buffer: Option<Buffer>,
+    triangle_count: u32,
+    flat_normals: Vec<[f32; 4]>, // one entry per triangle, .xyz = normal
+}
+
 /// Reusable Metal renderer with hardware RT. Output texture size is
 /// fixed at construction (`new(w, h)`); rebuilding for a different
 /// resolution means constructing a new MetalRenderer.
@@ -64,6 +102,9 @@ pub struct MetalRenderer {
     accel: Option<AccelerationStructure>,
     camera_buffer: Option<Buffer>,
     primitive_color_buffer: Option<Buffer>,
+    flat_normals_buffer: Option<Buffer>,   // global per-triangle flat normals
+    geom_offsets_buffer: Option<Buffer>,   // geom_id → first-triangle index
+    lights_buffer: Option<Buffer>,
     // Vertex / index buffers we built for the current AS. Must
     // outlive the AS (Metal's BVH stores GPU pointers into them).
     _scene_buffers: Vec<Buffer>,
@@ -116,6 +157,9 @@ impl MetalRenderer {
             accel: None,
             camera_buffer: None,
             primitive_color_buffer: None,
+            flat_normals_buffer: None,
+            geom_offsets_buffer: None,
+            lights_buffer: None,
             _scene_buffers: Vec::new(),
             clear_color: [0.05, 0.06, 0.10],
             has_scene: false,
@@ -140,6 +184,9 @@ impl MetalRenderer {
             self.accel = None;
             self.camera_buffer = None;
             self.primitive_color_buffer = None;
+            self.flat_normals_buffer = None;
+            self.geom_offsets_buffer = None;
+            self.lights_buffer = None;
             self._scene_buffers.clear();
             self.has_scene = false;
             return Ok(());
@@ -152,27 +199,40 @@ impl MetalRenderer {
         let mut geom_descs_owned: Vec<AccelerationStructureTriangleGeometryDescriptor> =
             Vec::with_capacity(scene.meshes.len());
         let mut primitive_colors: Vec<PrimitiveColor> = Vec::with_capacity(scene.meshes.len());
+        let mut geom_offsets: Vec<GeomOffset> = Vec::with_capacity(scene.meshes.len());
+        // Global per-triangle flat-normal buffer concatenated across
+        // all meshes; geom_offsets[gid].triangle_offset tells the
+        // kernel where this geometry's triangles begin.
+        let mut global_flat_normals: Vec<[f32; 4]> = Vec::new();
         let mut total_triangles: u64 = 0;
 
         for mesh in &scene.meshes {
-            let (vbuf, ibuf, tri_count) = self.build_mesh_buffers(mesh)?;
-            total_triangles += tri_count as u64;
+            let built = self.build_mesh_buffers(mesh)?;
+            total_triangles += built.triangle_count as u64;
+
+            // Record where this geometry's triangles start in the
+            // global normals buffer BEFORE pushing them.
+            geom_offsets.push(GeomOffset {
+                triangle_offset: global_flat_normals.len() as u32,
+                _pad: [0; 3],
+            });
+            global_flat_normals.extend_from_slice(&built.flat_normals);
 
             let gd = AccelerationStructureTriangleGeometryDescriptor::descriptor();
-            gd.set_vertex_buffer(Some(&vbuf));
+            gd.set_vertex_buffer(Some(&built.position_buffer));
             gd.set_vertex_buffer_offset(0);
             gd.set_vertex_stride(std::mem::size_of::<[f32; 3]>() as u64);
             gd.set_vertex_format(MTLAttributeFormat::Float3);
-            gd.set_triangle_count(tri_count as u64);
-            if let Some(ref idx_buf) = ibuf {
+            gd.set_triangle_count(built.triangle_count as u64);
+            if let Some(ref idx_buf) = built.index_buffer {
                 gd.set_index_buffer(Some(idx_buf));
                 gd.set_index_buffer_offset(0);
                 gd.set_index_type(MTLIndexType::UInt32);
             }
             geom_descs_owned.push(gd);
 
-            scene_buffers.push(vbuf);
-            if let Some(idx_buf) = ibuf {
+            scene_buffers.push(built.position_buffer);
+            if let Some(idx_buf) = built.index_buffer {
                 scene_buffers.push(idx_buf);
             }
 
@@ -235,6 +295,35 @@ impl MetalRenderer {
             total_triangles
         );
 
+        // Global flat-normals buffer (one float4 per triangle across
+        // all meshes). Indexed by `geom_offsets[geom_id].triangle_offset
+        // + primitive_id` in the kernel.
+        let flat_norm_buf = self.device.new_buffer_with_data(
+            global_flat_normals.as_ptr() as *const c_void,
+            (global_flat_normals.len().max(1) * std::mem::size_of::<[f32; 4]>()) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+
+        // Per-geometry offset table.
+        let geom_off_buf = self.device.new_buffer_with_data(
+            geom_offsets.as_ptr() as *const c_void,
+            (geom_offsets.len().max(1) * std::mem::size_of::<GeomOffset>()) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+
+        // Lights uniform.
+        let lights_uniform = build_lights_uniform(&scene.lights);
+        let lights_buf = self.device.new_buffer_with_data(
+            &lights_uniform as *const _ as *const c_void,
+            std::mem::size_of::<LightsUniform>() as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        log::info!(
+            "[metal-renderer] lights: {} directional + ambient {:?}",
+            lights_uniform.meta[0],
+            &lights_uniform.ambient[..3]
+        );
+
         // Camera uniform.
         let cam_uniform = build_camera_uniform(&scene.camera, self.width, self.height);
         let cam_buf = self.device.new_buffer_with_data(
@@ -253,6 +342,9 @@ impl MetalRenderer {
         self.accel = Some(accel);
         self.camera_buffer = Some(cam_buf);
         self.primitive_color_buffer = Some(color_buf);
+        self.flat_normals_buffer = Some(flat_norm_buf);
+        self.geom_offsets_buffer = Some(geom_off_buf);
+        self.lights_buffer = Some(lights_buf);
         self._scene_buffers = scene_buffers;
         self.has_scene = true;
         Ok(())
@@ -278,14 +370,35 @@ impl MetalRenderer {
         Ok(())
     }
 
+    /// Update just the lights uniform (cheap; no AS rebuild). Used
+    /// by Params IPC messages so live-dragging a light's intensity
+    /// or hue slider doesn't churn the BVH.
+    pub fn update_lights(&mut self, lights: &[Light]) -> anyhow::Result<()> {
+        let uni = build_lights_uniform(lights);
+        if let Some(buf) = self.lights_buffer.as_ref() {
+            let ptr = buf.contents() as *mut LightsUniform;
+            unsafe { ptr.write(uni); }
+        } else {
+            let lights_buf = self.device.new_buffer_with_data(
+                &uni as *const _ as *const c_void,
+                std::mem::size_of::<LightsUniform>() as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            self.lights_buffer = Some(lights_buf);
+        }
+        Ok(())
+    }
+
     /// Build vertex + index buffers for one mesh. Extracts pos.xyz
     /// from the stride-N interleaved input (editor sends stride=11:
     /// pos.xyz + color.rgb + normal.xyz + uv.xy) and pre-transforms
-    /// by the mesh's column-major 4×4 transform.
+    /// by the mesh's column-major 4×4 transform. ALSO computes a flat
+    /// per-triangle normal from the transformed vertices -- the
+    /// kernel uses these for Lambert shading.
     fn build_mesh_buffers(
         &self,
         mesh: &MeshInstance,
-    ) -> anyhow::Result<(Buffer, Option<Buffer>, u32)> {
+    ) -> anyhow::Result<MeshBuildResult> {
         let (vertices, indices_opt, stride) = match &mesh.geometry {
             GeometryRef::Inline {
                 vertices,
@@ -322,30 +435,64 @@ impl MetalRenderer {
             positions.push(tz);
         }
 
-        let vbuf = self.device.new_buffer_with_data(
+        let position_buffer = self.device.new_buffer_with_data(
             positions.as_ptr() as *const c_void,
             (positions.len() * std::mem::size_of::<f32>()) as u64,
             MTLResourceOptions::StorageModeShared,
         );
 
-        let (ibuf, tri_count) = if let Some(indices) = indices_opt {
-            if indices.len() % 3 != 0 {
-                return Err(anyhow!("index count {} not divisible by 3", indices.len()));
-            }
-            let ib = self.device.new_buffer_with_data(
-                indices.as_ptr() as *const c_void,
-                (indices.len() * std::mem::size_of::<u32>()) as u64,
-                MTLResourceOptions::StorageModeShared,
-            );
-            (Some(ib), (indices.len() / 3) as u32)
-        } else {
-            if vcount % 3 != 0 {
-                return Err(anyhow!("non-indexed mesh vertex count {} not divisible by 3", vcount));
-            }
-            (None, (vcount / 3) as u32)
-        };
+        let (index_buffer, triangle_count, indices_for_normals) =
+            if let Some(indices) = indices_opt {
+                if indices.len() % 3 != 0 {
+                    return Err(anyhow!("index count {} not divisible by 3", indices.len()));
+                }
+                let ib = self.device.new_buffer_with_data(
+                    indices.as_ptr() as *const c_void,
+                    (indices.len() * std::mem::size_of::<u32>()) as u64,
+                    MTLResourceOptions::StorageModeShared,
+                );
+                let tcount = (indices.len() / 3) as u32;
+                (Some(ib), tcount, Some(indices.as_slice()))
+            } else {
+                if vcount % 3 != 0 {
+                    return Err(anyhow!(
+                        "non-indexed mesh vertex count {} not divisible by 3",
+                        vcount
+                    ));
+                }
+                (None, (vcount / 3) as u32, None)
+            };
 
-        Ok((vbuf, ibuf, tri_count))
+        // Compute per-triangle flat normal from the (transformed)
+        // positions. Cross product of two edges, normalized; degenerate
+        // triangles get a zero normal (kernel branches on that).
+        let mut flat_normals: Vec<[f32; 4]> = Vec::with_capacity(triangle_count as usize);
+        let pos_at = |i: usize| -> Vec3 {
+            Vec3::new(positions[i * 3], positions[i * 3 + 1], positions[i * 3 + 2])
+        };
+        for tri in 0..triangle_count as usize {
+            let (i0, i1, i2) = if let Some(idx) = indices_for_normals {
+                (
+                    idx[tri * 3] as usize,
+                    idx[tri * 3 + 1] as usize,
+                    idx[tri * 3 + 2] as usize,
+                )
+            } else {
+                (tri * 3, tri * 3 + 1, tri * 3 + 2)
+            };
+            let v0 = pos_at(i0);
+            let v1 = pos_at(i1);
+            let v2 = pos_at(i2);
+            let n = (v1 - v0).cross(v2 - v0).normalize_or_zero();
+            flat_normals.push([n.x, n.y, n.z, 0.0]);
+        }
+
+        Ok(MeshBuildResult {
+            position_buffer,
+            index_buffer,
+            triangle_count,
+            flat_normals,
+        })
     }
 
     /// Render one frame. If no scene has been pushed yet, returns
@@ -365,6 +512,9 @@ impl MetalRenderer {
         let accel = self.accel.as_ref().unwrap();
         let cam_buf = self.camera_buffer.as_ref().unwrap();
         let color_buf = self.primitive_color_buffer.as_ref().unwrap();
+        let flat_norm_buf = self.flat_normals_buffer.as_ref().unwrap();
+        let geom_off_buf = self.geom_offsets_buffer.as_ref().unwrap();
+        let lights_buf = self.lights_buffer.as_ref().unwrap();
 
         let cb = self.queue.new_command_buffer();
         let enc = cb.new_compute_command_encoder();
@@ -374,6 +524,9 @@ impl MetalRenderer {
         enc.use_resource(&**accel, MTLResourceUsage::Read);
         enc.set_buffer(1, Some(cam_buf), 0);
         enc.set_buffer(2, Some(color_buf), 0);
+        enc.set_buffer(3, Some(flat_norm_buf), 0);
+        enc.set_buffer(4, Some(geom_off_buf), 0);
+        enc.set_buffer(5, Some(lights_buf), 0);
 
         let tg_size = MTLSize { width: 16, height: 16, depth: 1 };
         let tg_count = MTLSize {
@@ -406,11 +559,62 @@ impl MetalRenderer {
     }
 }
 
+/// Pack the editor-side `lights` array into the kernel's
+/// LightsUniform shape. c-1 scope: only Light::Directional entries
+/// are honored; Point / Spot / Area are silently skipped (re-added
+/// in c-2 when the kernel grows real light evaluation per type).
+/// If the scene has no directional lights, we synthesize a warm
+/// "sunset-from-up-right" default so shaded scenes aren't pure
+/// ambient (which would look completely flat).
+fn build_lights_uniform(lights: &[Light]) -> LightsUniform {
+    let mut packed: Vec<(Vec3, [f32; 3], f32)> = Vec::new();
+    for light in lights {
+        if let Light::Directional {
+            direction,
+            color,
+            intensity,
+        } = light
+        {
+            // Editor convention: `direction` is the direction light rays
+            // travel (e.g. (0,-1,0) for sun overhead). For Lambert we
+            // want the vector FROM the surface TO the light source =
+            // -direction. Negate on the CPU; kernel just dots N with
+            // dirs[i].xyz directly.
+            let d = -Vec3::from(*direction).normalize_or_zero();
+            packed.push((d, *color, *intensity));
+            if packed.len() >= 4 {
+                break;
+            }
+        }
+        // c-1: ignore non-directional lights. c-2 adds point/spot
+        // evaluation per-type in the kernel.
+    }
+    if packed.is_empty() {
+        // Default sunlit angle. Warm color, mid intensity. Looks fine
+        // for any scene with shaded materials wired up.
+        let d = -Vec3::new(-0.3, -0.8, -0.4).normalize();
+        packed.push((d, [1.0, 0.95, 0.85], 1.0));
+    }
+
+    let mut dirs = [[0.0f32; 4]; 4];
+    let mut colors = [[0.0f32; 4]; 4];
+    for (i, (d, c, intensity)) in packed.iter().enumerate() {
+        dirs[i] = [d.x, d.y, d.z, 0.0];
+        colors[i] = [c[0], c[1], c[2], *intensity];
+    }
+
+    LightsUniform {
+        ambient: [0.15, 0.17, 0.20, 1.0],
+        meta: [packed.len() as u32, 0, 0, 0],
+        dirs,
+        colors,
+    }
+}
+
 /// Convert the editor's pos/target/up/fov camera into a precomputed
 /// orthonormal basis + tan(fov/2) + aspect tuple that the kernel can
 /// consume without any per-pixel cross() / normalize() work.
 fn build_camera_uniform(camera: &Camera, width: u32, height: u32) -> CameraUniform {
-    use glam::Vec3;
     let eye = Vec3::from(camera.pos);
     let target = Vec3::from(camera.target);
     let up_hint = Vec3::from(camera.up);
