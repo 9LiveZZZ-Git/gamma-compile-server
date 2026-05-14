@@ -26,6 +26,7 @@ use metal::{
 use std::ffi::c_void;
 
 use crate::scene::{Camera, GeometryRef, Light, Material, MeshInstance, Scene};
+use crate::render::metalfx::{ScalerConfig, TemporalDenoisedScaler};
 use glam::Vec3;
 
 const KERNEL_SRC: &str = include_str!("../shaders/triangle.metal");
@@ -151,11 +152,15 @@ pub struct MetalRenderer {
     accum_texture: Texture,
     // Sprint 7.5.6.f -- primary-hit normal G-buffer. RGBA32F where
     // .xyz = world-space normal at the camera ray's first hit, .w
-    // unused. The denoise kernel uses this for edge-stopping: a
-    // neighbor pixel's contribution to the blur is weighted by how
-    // similar its normal is to ours, so we don't smear across
-    // geometric edges (silhouettes / face boundaries).
+    // unused. The denoise kernel uses this for edge-stopping.
     normal_texture: Texture,
+    // Sprint 7.5.6.f.3 -- MetalFX TemporalDenoisedScaler. Apple's
+    // neural-net temporal denoiser for path-traced rendering. None
+    // if creation failed (older macOS, unsupported GPU, or build
+    // running without MetalFX framework available). In f.3.a we
+    // just probe creation; f.3.b/c add G-buffers + wire the scaler
+    // into the render loop.
+    metalfx_scaler: Option<TemporalDenoisedScaler>,
     frame_count: u32,
     // Tiny per-frame uniform: just the current frame_count (used to
     // seed RNG + as the denominator for accum averaging). Updated in
@@ -256,6 +261,43 @@ impl MetalRenderer {
             MTLResourceOptions::StorageModeShared,
         );
 
+        // Sprint 7.5.6.f.3.a -- attempt to create the MetalFX scaler.
+        // Returns Ok(None) if the device / OS doesn't support it; we
+        // log + continue with the existing spatial denoiser path in
+        // that case. The dimensions match the current render target.
+        // f.3.b will add the G-buffer outputs the scaler reads; f.3.c
+        // will switch render_frame to use it instead of rt_denoise.
+        let metalfx_scaler = match TemporalDenoisedScaler::try_new(
+            &device,
+            &ScalerConfig {
+                input_width: width,
+                input_height: height,
+                output_width: width,
+                output_height: height,
+                ..ScalerConfig::default()
+            },
+        ) {
+            Ok(Some(s)) => {
+                log::info!(
+                    "[metalfx] TemporalDenoisedScaler ready: in {}x{} -> out {}x{}",
+                    s.input_width, s.input_height, s.output_width, s.output_height
+                );
+                Some(s)
+            }
+            Ok(None) => {
+                log::warn!(
+                    "[metalfx] TemporalDenoisedScaler not available on this device/OS; \
+                     falling back to spatial denoiser for now. Requires macOS 15+ \
+                     and an Apple Silicon GPU."
+                );
+                None
+            }
+            Err(e) => {
+                log::warn!("[metalfx] scaler creation threw: {}; falling back", e);
+                None
+            }
+        };
+
         Ok(MetalRenderer {
             device,
             queue,
@@ -266,6 +308,7 @@ impl MetalRenderer {
             height,
             accum_texture,
             normal_texture,
+            metalfx_scaler,
             frame_count: 0,
             path_state_buffer,
             accel: None,

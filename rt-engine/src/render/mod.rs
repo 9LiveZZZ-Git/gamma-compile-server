@@ -12,6 +12,9 @@
 pub mod metal_path;
 
 #[cfg(target_os = "macos")]
+pub mod metalfx;
+
+#[cfg(target_os = "macos")]
 pub use metal_path::render_test_triangle;
 
 #[cfg(not(target_os = "macos"))]
