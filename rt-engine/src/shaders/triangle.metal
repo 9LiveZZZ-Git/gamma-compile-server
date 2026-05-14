@@ -260,11 +260,16 @@ inline float3 shade_direct(
     return color;
 }
 
-// ── Main kernel ──────────────────────────────────────────────────────
+// ── Main path-tracing kernel ─────────────────────────────────────────
+//
+// Writes: accumTex (RGBA32F, sum of samples) and normalTex (RGBA32F,
+// primary-hit world normal in .xyz, .w = 1 on hit / 0 on miss for the
+// denoise kernel's edge-stopping). The display texture is left for
+// rt_denoise to populate.
 
 kernel void rt_scene(
-    texture2d<float, access::write>     outTex      [[texture(0)]],
     texture2d<float, access::read_write> accumTex   [[texture(1)]],
+    texture2d<float, access::write>     normalTex   [[texture(2)]],
     primitive_acceleration_structure    accel       [[buffer(0)]],
     constant CameraUniform&  camera                 [[buffer(1)]],
     constant MaterialUniform* materials             [[buffer(2)]],
@@ -275,8 +280,8 @@ kernel void rt_scene(
     constant PathState&       path                  [[buffer(7)]],
     uint2 gid [[thread_position_in_grid]]
 ) {
-    const uint w = outTex.get_width();
-    const uint h = outTex.get_height();
+    const uint w = accumTex.get_width();
+    const uint h = accumTex.get_height();
     if (gid.x >= w || gid.y >= h) return;
 
     const uint frame = path.frame_count;
@@ -308,6 +313,12 @@ kernel void rt_scene(
     float3 throughput = float3(1.0);
     float3 sample     = float3(0.0);
     bool   terminated = false;
+
+    // Sprint 7.5.6.f -- track the primary-hit normal for the denoise
+    // G-buffer. Zero if we miss everything (sky pixel; denoiser
+    // treats it as "no neighbor blending").
+    float3 primary_normal = float3(0.0);
+    bool   primary_hit    = false;
 
     for (int bounce = 0; bounce < MAX_BOUNCES; bounce++) {
         intersection_result<triangle_data> hit = isr.intersect(r, accel);
@@ -342,6 +353,15 @@ kernel void rt_scene(
         const float ndotrd = dot(N_geom, r.direction);
         const bool entering = ndotrd < NORMAL_FLIP_THR;
         float3 N = entering ? N_geom : -N_geom;
+
+        // Stash the primary-hit normal for the denoise G-buffer. We
+        // do this on the very first bounce only (the primary ray);
+        // subsequent bounces' normals are irrelevant for spatial
+        // denoising of the per-pixel color.
+        if (bounce == 0) {
+            primary_normal = N;
+            primary_hit    = true;
+        }
 
         const MaterialUniform mat = materials[gid_hit];
         const uint mtype = mat.flags.x;
@@ -457,7 +477,104 @@ kernel void rt_scene(
     }
     accumTex.write(float4(new_accum, 0.0), gid);
 
-    // Output = average over all frames so far.
-    const float3 avg = new_accum / float(frame + 1u);
-    outTex.write(float4(avg, 1.0), gid);
+    // Sprint 7.5.6.f -- write G-buffer for the denoise pass.
+    // .xyz = world-space normal at primary hit; .w = 1 if hit, 0 if
+    // miss (sky pixel). The denoiser uses .w to decide "neighbor is
+    // a valid blur source for me" and dot(N_self, N_neighbor) for the
+    // edge-stopping weight.
+    normalTex.write(
+        float4(primary_normal, primary_hit ? 1.0 : 0.0),
+        gid
+    );
+
+    // No display write here -- rt_denoise reads accumTex + normalTex
+    // and produces the final display output in its own kernel pass.
+}
+
+// ── Denoise kernel ───────────────────────────────────────────────────
+//
+// 5x5 edge-aware spatial blur. For each pixel, samples 25 neighbors
+// (clamped at image edges), weights each by (1) the neighbor's
+// validity (.w from normalTex), (2) cosine similarity of normals,
+// (3) a Gaussian-ish spatial falloff. The weighted average is
+// written to the display.
+//
+// Convergence-aware: at high frame counts (= clean accum), the blur
+// becomes almost transparent because the input is already smooth.
+// At low frame counts (orbit case), the blur kicks in hardest.
+// Strength taper based on frame_count is a simple implementation
+// of the "history confidence" trick.
+
+constant float DENOISE_SIGMA_N = 0.15;  // higher = more cross-edge blur
+
+kernel void rt_denoise(
+    texture2d<float, access::write>      outTex      [[texture(0)]],
+    texture2d<float, access::read>       accumTex    [[texture(1)]],
+    texture2d<float, access::read>       normalTex   [[texture(2)]],
+    constant PathState&                  path        [[buffer(7)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    const uint w = outTex.get_width();
+    const uint h = outTex.get_height();
+    if (gid.x >= w || gid.y >= h) return;
+
+    const uint frame = path.frame_count;
+    const float inv_samples = 1.0 / float(frame + 1u);
+
+    const float4 self_normal_v = normalTex.read(gid);
+    const float3 self_normal = self_normal_v.xyz;
+    const bool   self_valid  = self_normal_v.w > 0.5;
+
+    // For sky pixels (primary miss), no neighbor blending -- they
+    // tend to be uniformly-colored gradient already.
+    if (!self_valid) {
+        const float3 c = accumTex.read(gid).rgb * inv_samples;
+        outTex.write(float4(c, 1.0), gid);
+        return;
+    }
+
+    // Per-pixel "noise budget" tapers with sample count. Many samples
+    // = converged image = mostly pass-through. Few samples = noisy =
+    // full blur. Clamps the high-spp case toward identity so static
+    // scenes look as crisp as the path tracer produces them.
+    const float taper = 1.0 / (1.0 + float(frame) * 0.05);
+
+    float3 sum  = float3(0.0);
+    float  wsum = 0.0;
+    const int R = 2;  // 5x5 footprint
+    for (int dy = -R; dy <= R; dy++) {
+        for (int dx = -R; dx <= R; dx++) {
+            const int sx = clamp(int(gid.x) + dx, 0, int(w) - 1);
+            const int sy = clamp(int(gid.y) + dy, 0, int(h) - 1);
+            const uint2 sgid = uint2(uint(sx), uint(sy));
+
+            const float4 nv = normalTex.read(sgid);
+            const float3 N_n = nv.xyz;
+            const bool  valid = nv.w > 0.5;
+            if (!valid) continue;
+
+            // Cosine similarity (1 = identical normal, 0 = perpendicular,
+            // -1 = opposite). Convert to a Gaussian-ish weight.
+            const float cos_sim = max(0.0, dot(self_normal, N_n));
+            const float wN = exp(-(1.0 - cos_sim) * (1.0 - cos_sim) /
+                                 (2.0 * DENOISE_SIGMA_N * DENOISE_SIGMA_N));
+
+            // Gaussian spatial falloff (sigma ≈ R/2 = 1 pixel).
+            const float r2 = float(dx * dx + dy * dy);
+            const float wS = exp(-r2 * 0.5);
+
+            const float w = wN * wS;
+            const float3 c = accumTex.read(sgid).rgb * inv_samples;
+            sum  += c * w;
+            wsum += w;
+        }
+    }
+    const float3 filtered = (wsum > 0.0) ? sum / wsum : accumTex.read(gid).rgb * inv_samples;
+    const float3 unfiltered = accumTex.read(gid).rgb * inv_samples;
+
+    // Blend filtered ← unfiltered by `taper`. High frame = mostly
+    // unfiltered (= accum already clean). Low frame = mostly filtered
+    // (= cleaning up the 1-spp noise).
+    const float3 out_color = mix(unfiltered, filtered, taper);
+    outTex.write(float4(out_color, 1.0), gid);
 }

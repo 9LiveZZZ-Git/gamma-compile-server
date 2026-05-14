@@ -134,6 +134,10 @@ pub struct MetalRenderer {
     device: Device,
     queue: CommandQueue,
     pipeline: ComputePipelineState,
+    // Sprint 7.5.6.f -- separate denoise pipeline. Path-tracing
+    // kernel writes accum + normal G-buffer; denoise kernel reads
+    // both, applies a 5x5 edge-aware spatial filter, writes display.
+    denoise_pipeline: ComputePipelineState,
     texture: Texture,
     pub width: u32,
     pub height: u32,
@@ -145,6 +149,13 @@ pub struct MetalRenderer {
     // branches on frame_count == 0 and overwrites instead of reading-
     // adding-writing.
     accum_texture: Texture,
+    // Sprint 7.5.6.f -- primary-hit normal G-buffer. RGBA32F where
+    // .xyz = world-space normal at the camera ray's first hit, .w
+    // unused. The denoise kernel uses this for edge-stopping: a
+    // neighbor pixel's contribution to the blur is weighted by how
+    // similar its normal is to ours, so we don't smear across
+    // geometric edges (silhouettes / face boundaries).
+    normal_texture: Texture,
     frame_count: u32,
     // Tiny per-frame uniform: just the current frame_count (used to
     // seed RNG + as the denominator for accum averaging). Updated in
@@ -194,6 +205,16 @@ impl MetalRenderer {
             .new_compute_pipeline_state_with_function(&func)
             .map_err(|e| anyhow!("compute pipeline create failed: {}", e))?;
 
+        // Sprint 7.5.6.f -- second pipeline for the spatial denoiser.
+        // Same MSL source; different entry point. Compiled once at
+        // construction, dispatched after rt_scene each frame.
+        let denoise_func = lib
+            .get_function("rt_denoise", None)
+            .map_err(|e| anyhow!("kernel function 'rt_denoise' not found: {}", e))?;
+        let denoise_pipeline = device
+            .new_compute_pipeline_state_with_function(&denoise_func)
+            .map_err(|e| anyhow!("denoise pipeline create failed: {}", e))?;
+
         let tex_desc = TextureDescriptor::new();
         tex_desc.set_width(width as u64);
         tex_desc.set_height(height as u64);
@@ -214,6 +235,19 @@ impl MetalRenderer {
         accum_desc.set_storage_mode(MTLStorageMode::Private);
         let accum_texture = device.new_texture(&accum_desc);
 
+        // Sprint 7.5.6.f -- normal G-buffer. Same shape as accum;
+        // the path tracer writes the primary-hit normal here, the
+        // denoise kernel reads it for edge-stopping. RGBA32F to keep
+        // full float precision (cosine-similarity weights below
+        // benefit from this).
+        let normal_desc = TextureDescriptor::new();
+        normal_desc.set_width(width as u64);
+        normal_desc.set_height(height as u64);
+        normal_desc.set_pixel_format(MTLPixelFormat::RGBA32Float);
+        normal_desc.set_usage(MTLTextureUsage::ShaderWrite | MTLTextureUsage::ShaderRead);
+        normal_desc.set_storage_mode(MTLStorageMode::Private);
+        let normal_texture = device.new_texture(&normal_desc);
+
         // Per-frame state uniform (just frame_count for now). Updated
         // in place each render via the shared buffer's contents()
         // pointer; no per-frame allocation.
@@ -226,10 +260,12 @@ impl MetalRenderer {
             device,
             queue,
             pipeline,
+            denoise_pipeline,
             texture,
             width,
             height,
             accum_texture,
+            normal_texture,
             frame_count: 0,
             path_state_buffer,
             accel: None,
@@ -665,10 +701,15 @@ impl MetalRenderer {
         }
 
         let cb = self.queue.new_command_buffer();
+
+        // ── Path-tracing dispatch ─────────────────────────────────
+        // Writes:  accum_texture (RGBA32F) + normal_texture (RGBA32F)
+        // The display texture is written by the SECOND (denoise) pass
+        // since the denoiser needs to blend neighbors before display.
         let enc = cb.new_compute_command_encoder();
         enc.set_compute_pipeline_state(&self.pipeline);
-        enc.set_texture(0, Some(&self.texture));
         enc.set_texture(1, Some(&self.accum_texture));
+        enc.set_texture(2, Some(&self.normal_texture));
         enc.set_acceleration_structure(0, Some(&**accel));
         enc.use_resource(&**accel, MTLResourceUsage::Read);
         enc.set_buffer(1, Some(cam_buf), 0);
@@ -687,6 +728,25 @@ impl MetalRenderer {
         };
         enc.dispatch_thread_groups(tg_count, tg_size);
         enc.end_encoding();
+
+        // ── Denoise dispatch ──────────────────────────────────────
+        // Reads:  accum_texture + normal_texture
+        // Writes: display texture (RGBA8)
+        // 5x5 edge-aware blur with normal similarity. Static scenes
+        // (accum already converged) see almost no change; orbiting
+        // scenes (1-spp noise) get noticeably cleaner. Both kernels
+        // run as separate compute encoders in the same command
+        // buffer; Metal inserts the texture barrier between them
+        // automatically.
+        let dn_enc = cb.new_compute_command_encoder();
+        dn_enc.set_compute_pipeline_state(&self.denoise_pipeline);
+        dn_enc.set_texture(0, Some(&self.texture));
+        dn_enc.set_texture(1, Some(&self.accum_texture));
+        dn_enc.set_texture(2, Some(&self.normal_texture));
+        dn_enc.set_buffer(7, Some(&self.path_state_buffer), 0);
+        dn_enc.dispatch_thread_groups(tg_count, tg_size);
+        dn_enc.end_encoding();
+
         cb.commit();
         cb.wait_until_completed();
 
