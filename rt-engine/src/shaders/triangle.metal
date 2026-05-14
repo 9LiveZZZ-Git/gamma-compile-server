@@ -70,12 +70,14 @@ struct PathState {
     uint     pad0;
     uint     pad1;
     uint     pad2;
-    // f.3.b -- previous frame's view*projection matrix (column-
-    // major). Path tracer projects current-frame opaque hit points
-    // through this to get last-frame screen UV, motion = current_uv -
-    // last_uv. 16-byte aligned at offset 16, matches the Rust
-    // PathStateUniform field after the 12-byte pad.
+    // f.3.b -- previous frame's view*projection matrix.
     float4x4 prev_view_proj;
+    // f.3.d -- per-frame sub-pixel jitter (Halton(2,3) sequence
+    // value in [0, 1]). Used as the SAME offset for every pixel in
+    // this frame, so the kernel + MetalFX can agree on where the
+    // ray hit within each pixel. Without this they disagree and
+    // MetalFX blurs disparate sub-pixel content together.
+    float4   jitter;
 };
 
 constant float PI = 3.14159265358979;
@@ -303,11 +305,15 @@ kernel void rt_scene(
     const uint frame = path.frame_count;
     thread uint rng  = init_rng(gid, frame, 0u);
 
-    // Sub-pixel jittered primary ray. Random offset in [0..1] per
-    // pixel per frame gives free AA as the accumulation averages
-    // many jittered samples.
-    const float u = (float(gid.x) + rand01(rng)) / float(w);
-    const float v = (float(gid.y) + rand01(rng)) / float(h);
+    // Sub-pixel jittered primary ray. f.3.d -- one global offset
+    // for the entire frame from a Halton(2, 3) sequence (path.jitter
+    // .xy in [0, 1]); over many frames this covers the sub-pixel
+    // grid uniformly. MetalFX gets the same value (centered to
+    // [-0.5, 0.5]) so it can correlate sub-pixel samples across
+    // frames. The kernel's RNG is still used for everything else
+    // (random bounce direction, Fresnel-mixed glass branch).
+    const float u = (float(gid.x) + path.jitter.x) / float(w);
+    const float v = (float(gid.y) + path.jitter.y) / float(h);
     const float screen_x = (2.0 * u - 1.0) * camera.misc.x * camera.misc.y;
     const float screen_y = (1.0 - 2.0 * v) * camera.misc.x;
     ray r;
@@ -512,12 +518,16 @@ kernel void rt_scene(
     }
     accumTex.write(float4(new_accum, 0.0), gid);
 
-    // f.3.c -- noisy single-sample color for MetalFX. Just this
-    // frame's path-traced sample, NOT the running accumulation.
-    // MetalFX's temporal accumulator handles convergence using
-    // motion vectors; we just need to give it the per-frame Monte
-    // Carlo result.
-    noisyColorTex.write(float4(sample, 1.0), gid);
+    // f.3.c -- noisy single-sample color for MetalFX.
+    // f.3.d -- firefly clamp before output. Glass / mirror paths
+    // occasionally produce single super-bright samples (caustics,
+    // edge-of-TIR cases). Without clamping, these stick around in
+    // MetalFX's temporal blend for many frames and look like
+    // sparkly artifacts. min() to a reasonable HDR ceiling keeps
+    // the unbiased average correct in expectation while killing
+    // the worst outliers.
+    const float3 clamped_sample = min(sample, float3(8.0));
+    noisyColorTex.write(float4(clamped_sample, 1.0), gid);
 
     // ── G-buffer writes ───────────────────────────────────────────
     // Normal: .xyz = world-space normal at primary opaque hit, .w =
@@ -651,13 +661,30 @@ kernel void rt_denoise(
     outTex.write(float4(out_color, 1.0), gid);
 }
 
-// ── Tonemap kernel (f.3.c) ───────────────────────────────────────────
+// ── Tonemap kernel (f.3.c, ACES upgrade in f.3.d) ────────────────────
 //
-// Copies the MetalFX output (RGBA16Float, HDR) into the display
-// texture (RGBA8Unorm). For c-3 v1 this is just a Reinhard-ish
-// tonemap (color / (1 + color)) plus a gamma 2.2 correction --
-// keeps highlights from clipping to flat white while preserving
-// mid-tones. Polish (ACES, filmic, exposure curve) lands in f.3.d.
+// Copies the MetalFX output (RGBA16Float HDR) into the display
+// texture (RGBA8Unorm). f.3.d switches from a basic Reinhard
+// (which dimmed mid-tones noticeably -- 1.0 in becomes 0.5 out)
+// to the Narkowicz approximation of the ACES filmic curve. ACES
+// preserves bright mid-tones much better, gives more contrast,
+// and is the industry-standard answer for tonemapping HDR
+// path-traced output.
+//
+// EXPOSURE knob multiplies the linear color before the curve --
+// 1.0 is "as rendered"; 1.5 lifts the image slightly to compensate
+// for the curve's natural dimming of dark mids.
+
+constant float EXPOSURE = 1.2;
+
+inline float3 aces_filmic(float3 x) {
+    const float a = 2.51;
+    const float b = 0.03;
+    const float c = 2.43;
+    const float d = 0.59;
+    const float e = 0.14;
+    return saturate((x * (a * x + b)) / (x * (c * x + d) + e));
+}
 
 kernel void rt_tonemap(
     texture2d<float, access::write> outTex  [[texture(0)]],
@@ -669,11 +696,7 @@ kernel void rt_tonemap(
     if (gid.x >= w || gid.y >= h) return;
 
     float3 c = max(hdrTex.read(gid).rgb, float3(0.0));
-    // Reinhard
-    c = c / (1.0 + c);
-    // Approximate sRGB gamma -- compensates for the linear-space
-    // accumulation. RGBA8Unorm storage is linear; the browser /
-    // editor pipeline does its own sRGB conversion downstream.
-    // c = pow(c, float3(1.0 / 2.2));  // optional if downstream is sRGB
+    c *= EXPOSURE;
+    c = aces_filmic(c);
     outTex.write(float4(c, 1.0), gid);
 }

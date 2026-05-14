@@ -63,6 +63,29 @@ struct PathStateUniform {
     frame_count: u32,
     _pad: [u32; 3],
     prev_view_proj: [[f32; 4]; 4],
+    /// Sprint 7.5.6.f.3.d -- per-frame global sub-pixel jitter.
+    /// .xy = Halton(2,3) sequence value in [0, 1]. The kernel uses
+    /// this as the same offset for ALL pixels in a given frame
+    /// (replacing c-e's per-pixel random offset). MetalFX gets the
+    /// same value (centered to [-0.5, 0.5]) via setJitterOffset so
+    /// it can correlate this frame's hits with the prior frame's
+    /// hits across sub-pixel positions.
+    jitter: [f32; 4],
+}
+
+/// Halton sequence in base `b`, for index `i`. Returns a low-
+/// discrepancy value in [0, 1]. Standard temporal-AA jitter source
+/// -- successive frames' jitters cover sub-pixel positions evenly
+/// faster than uniform random, giving cleaner reconstruction.
+fn halton(base: u32, mut i: u32) -> f32 {
+    let mut f = 1.0_f32;
+    let mut r = 0.0_f32;
+    while i > 0 {
+        f /= base as f32;
+        r += f * (i % base) as f32;
+        i /= base;
+    }
+    r
 }
 
 /// Per-mesh material uniform. Matches MSL MaterialUniform layout.
@@ -874,13 +897,9 @@ impl MetalRenderer {
         let geom_off_buf = self.geom_offsets_buffer.as_ref().unwrap();
         let lights_buf = self.lights_buffer.as_ref().unwrap();
 
-        // Sprint 7.5.6.e + f.3.b -- update per-frame path-tracing
-        // state. path_state_buffer is shared storage so we patch the
-        // contents() pointer directly each frame; no reallocation.
-        // Contains the frame counter (RNG seed + accumulation
-        // denominator) plus the previous-frame view-projection
-        // (motion-vector projection in the path tracer's G-buffer
-        // output).
+        // Sprint 7.5.6.e + f.3.b + f.3.d -- update per-frame path-
+        // tracing state. path_state_buffer is shared storage so we
+        // patch the contents() pointer each frame; no reallocation.
         let prev_vp_for_motion = self.view_proj_history.unwrap_or(IDENTITY_VIEW_PROJ);
         let pvp_cols: [[f32; 4]; 4] = [
             [prev_vp_for_motion[0],  prev_vp_for_motion[1],  prev_vp_for_motion[2],  prev_vp_for_motion[3]],
@@ -888,10 +907,19 @@ impl MetalRenderer {
             [prev_vp_for_motion[8],  prev_vp_for_motion[9],  prev_vp_for_motion[10], prev_vp_for_motion[11]],
             [prev_vp_for_motion[12], prev_vp_for_motion[13], prev_vp_for_motion[14], prev_vp_for_motion[15]],
         ];
+        // f.3.d -- Halton(2,3) per-frame sub-pixel jitter. Used as
+        // the SAME offset for every pixel this frame; over many
+        // frames the sequence covers the sub-pixel space evenly.
+        // Halton index = frame_count + 1 so frame 0 isn't (0, 0)
+        // (which puts every ray at pixel corner; trivially correlated).
+        let halton_idx = self.frame_count.wrapping_add(1);
+        let jitter_x = halton(2, halton_idx);
+        let jitter_y = halton(3, halton_idx);
         let path_state = PathStateUniform {
             frame_count: self.frame_count,
             _pad: [0; 3],
             prev_view_proj: pvp_cols,
+            jitter: [jitter_x, jitter_y, 0.0, 0.0],
         };
         unsafe {
             let ptr = self.path_state_buffer.contents() as *mut PathStateUniform;
@@ -956,10 +984,14 @@ impl MetalRenderer {
                 self.width as f32,
                 self.height as f32,
             );
-            // No subpixel jitter yet (kernel jitters per-pixel
-            // randomly, not per-frame globally). f.3.d will switch
-            // to a Halton sequence and pass it here.
-            scaler.set_jitter_offset(0.0, 0.0);
+            // f.3.d -- Halton sub-pixel jitter, centered around 0
+            // (kernel uses jitter in [0, 1] starting from pixel
+            // top-left; MetalFX wants jitter in [-0.5, 0.5] relative
+            // to pixel center). Same value the path tracer used for
+            // this frame's primary ray offset; lets MetalFX
+            // correlate sub-pixel samples across frames for AA +
+            // proper static-scene convergence.
+            scaler.set_jitter_offset(jitter_x - 0.5, jitter_y - 0.5);
 
             scaler.encode_to_command_buffer(cb);
 
