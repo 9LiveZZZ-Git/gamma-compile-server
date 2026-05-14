@@ -90,6 +90,13 @@ pub struct ScalerConfig {
     pub normal_format: MTLPixelFormat,
     /// Diffuse albedo. RGBA8Unorm (sRGB-space color).
     pub diffuse_albedo_format: MTLPixelFormat,
+    /// MTLFXTemporalScalerColorProcessingMode (set on the descriptor
+    /// at scaler creation time; can't be changed per-frame).
+    ///   0 = PerceptualLDR  (gamma-encoded sRGB in [0,1])
+    ///   1 = Linear         (linear-encoded in [0,1])
+    ///   2 = HDR            (linear, unbounded -- what we want for
+    ///                       path-traced RGBA16Float color input)
+    pub color_processing_mode: u64,
 }
 
 impl Default for ScalerConfig {
@@ -105,6 +112,7 @@ impl Default for ScalerConfig {
             motion_format: MTLPixelFormat::RG16Float,
             normal_format: MTLPixelFormat::RGBA16Float,
             diffuse_albedo_format: MTLPixelFormat::RGBA8Unorm,
+            color_processing_mode: 2, // HDR
         }
     }
 }
@@ -148,6 +156,31 @@ impl TemporalDenoisedScaler {
             let _: () = msg_send![desc, setMotionTextureFormat: cfg.motion_format as u64];
             let _: () = msg_send![desc, setNormalTextureFormat: cfg.normal_format as u64];
             let _: () = msg_send![desc, setDiffuseAlbedoTextureFormat: cfg.diffuse_albedo_format as u64];
+
+            // Color processing mode lives on the DESCRIPTOR, not on
+            // the scaler instance. Setting it on the scaler at
+            // runtime throws an "unrecognized selector" ObjC exception
+            // -- which Rust can't catch and which aborts the process.
+            // So we set it here, at creation. f.3.d-fix3.
+            //
+            // We guard with respondsToSelector: because the descriptor
+            // class might be different between macOS versions; on
+            // older SDKs the property may live on a different
+            // descriptor or not exist at all. In that case the scaler
+            // falls back to its default mode (which is documented as
+            // PerceptualLDR for the temporal scaler but appears to be
+            // Linear for the denoised one -- close enough to HDR for
+            // our 16F input that the denoiser still works).
+            let responds_color_mode: BOOL = msg_send![
+                desc,
+                respondsToSelector: sel!(setColorProcessingMode:)
+            ];
+            if responds_color_mode != NO {
+                let _: () = msg_send![
+                    desc,
+                    setColorProcessingMode: cfg.color_processing_mode
+                ];
+            }
 
             // 3. [descriptor newTemporalDenoisedScalerWithDevice:device]
             //    -- returns nil if the device doesn't support it
@@ -248,23 +281,6 @@ impl TemporalDenoisedScaler {
         unsafe {
             let _: () = msg_send![self.ptr, setMotionVectorScaleX: x];
             let _: () = msg_send![self.ptr, setMotionVectorScaleY: y];
-        }
-    }
-
-    /// Color processing mode. Critical for HDR input -- the default
-    /// is `PerceptualLDR (0)` which assumes input is clamped to [0,1]
-    /// and applies the wrong tone-curve assumptions. For our
-    /// RGBA16Float HDR samples (where path-traced values can exceed
-    /// 1.0), set this to `HDR (2)` so MetalFX correctly handles the
-    /// wider range when doing temporal blending.
-    ///
-    /// Values (MTLFXTemporalScalerColorProcessingMode):
-    ///   0 = PerceptualLDR   -- gamma-encoded [0,1] (sRGB-ish)
-    ///   1 = Linear          -- linear [0,1]
-    ///   2 = HDR             -- linear, unbounded (what we want)
-    pub fn set_color_processing_mode(&self, mode: u64) {
-        unsafe {
-            let _: () = msg_send![self.ptr, setColorProcessingMode: mode];
         }
     }
 
