@@ -44,6 +44,27 @@ struct CameraUniform {
     misc: [f32; 4],    // .x = tan(fov/2), .y = aspect, .zw = unused
 }
 
+/// Per-frame uniform updated every render_frame call. Holds the
+/// frame counter (RNG seed + accumulation count) AND the previous
+/// frame's view-projection matrix (for motion-vector computation
+/// in the path tracer). Lives in `path_state_buffer`, written via
+/// the shared-storage contents() pointer at the start of each
+/// render so the kernel sees the latest values without a fresh
+/// allocation.
+///
+/// Layout (80 bytes total):
+///   offset 0..3   frame_count: u32
+///   offset 4..15  pad: 3× u32 (to keep float4x4 at offset 16,
+///                  which Metal requires for 16-byte alignment)
+///   offset 16..79 prev_view_proj: column-major float4x4 (4×16 bytes)
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+struct PathStateUniform {
+    frame_count: u32,
+    _pad: [u32; 3],
+    prev_view_proj: [[f32; 4]; 4],
+}
+
 /// Per-mesh material uniform. Matches MSL MaterialUniform layout.
 /// Single struct discriminated by `flags.x` so the kernel can `switch`
 /// on the material type (0=Unlit, 1=Phong, 2=PBR).
@@ -150,10 +171,24 @@ pub struct MetalRenderer {
     // branches on frame_count == 0 and overwrites instead of reading-
     // adding-writing.
     accum_texture: Texture,
-    // Sprint 7.5.6.f -- primary-hit normal G-buffer. RGBA32F where
-    // .xyz = world-space normal at the camera ray's first hit, .w
-    // unused. The denoise kernel uses this for edge-stopping.
+    // Sprint 7.5.6.f -- primary-hit G-buffer. Three textures:
+    //   normal_texture  -- .xyz = world-space normal at first opaque
+    //                      hit (RGBA32F). f v1: edge-stopping for
+    //                      spatial denoise. f.3: input to MetalFX.
+    //   depth_texture   -- .x = linear distance from camera to first
+    //                      opaque hit (R32F). f.3: MetalFX
+    //                      disocclusion detection.
+    //   motion_texture  -- .xy = screen-space motion vector in UV
+    //                      coordinates (RG16F). f.3: MetalFX temporal
+    //                      reprojection. Computed from current hit
+    //                      world position + previous-frame view-proj.
+    //   albedo_texture  -- .xyz = raw surface color before lighting
+    //                      (RGBA8Unorm). f.3: MetalFX demodulates
+    //                      so edges between materials don't blur.
     normal_texture: Texture,
+    depth_texture: Texture,
+    motion_texture: Texture,
+    albedo_texture: Texture,
     // Sprint 7.5.6.f.3 -- MetalFX TemporalDenoisedScaler. Apple's
     // neural-net temporal denoiser for path-traced rendering. None
     // if creation failed (older macOS, unsupported GPU, or build
@@ -161,6 +196,21 @@ pub struct MetalRenderer {
     // just probe creation; f.3.b/c add G-buffers + wire the scaler
     // into the render loop.
     metalfx_scaler: Option<TemporalDenoisedScaler>,
+    // Sprint 7.5.6.f.3.b -- camera matrix history for motion vector
+    // computation. Two fields:
+    //   current_view_proj: the view*projection matrix of the most
+    //     recently uploaded camera. Computed in update_camera /
+    //     update_scene from the editor-sent pose.
+    //   view_proj_history: what was used to render the PREVIOUS
+    //     frame. Shifted from current_view_proj at the end of each
+    //     render_frame. The kernel reads this (via path_state's
+    //     prev_view_proj field) to project current hit points
+    //     backward into the previous screen UV.
+    // None on both for the very first frame after construction --
+    // path_state.prev_view_proj falls back to identity, kernel
+    // outputs zero motion (correct for "no history").
+    current_view_proj: Option<[f32; 16]>,
+    view_proj_history: Option<[f32; 16]>,
     frame_count: u32,
     // Tiny per-frame uniform: just the current frame_count (used to
     // seed RNG + as the denominator for accum averaging). Updated in
@@ -253,11 +303,39 @@ impl MetalRenderer {
         normal_desc.set_storage_mode(MTLStorageMode::Private);
         let normal_texture = device.new_texture(&normal_desc);
 
-        // Per-frame state uniform (just frame_count for now). Updated
-        // in place each render via the shared buffer's contents()
-        // pointer; no per-frame allocation.
+        // Sprint 7.5.6.f.3.b -- depth + motion + albedo G-buffers.
+        // Depth = linear world-space distance from camera to first
+        // opaque hit. Motion = current_uv - prev_uv per pixel. Albedo
+        // = raw surface color before lighting (demodulated).
+        let depth_desc = TextureDescriptor::new();
+        depth_desc.set_width(width as u64);
+        depth_desc.set_height(height as u64);
+        depth_desc.set_pixel_format(MTLPixelFormat::R32Float);
+        depth_desc.set_usage(MTLTextureUsage::ShaderWrite | MTLTextureUsage::ShaderRead);
+        depth_desc.set_storage_mode(MTLStorageMode::Private);
+        let depth_texture = device.new_texture(&depth_desc);
+
+        let motion_desc = TextureDescriptor::new();
+        motion_desc.set_width(width as u64);
+        motion_desc.set_height(height as u64);
+        motion_desc.set_pixel_format(MTLPixelFormat::RG16Float);
+        motion_desc.set_usage(MTLTextureUsage::ShaderWrite | MTLTextureUsage::ShaderRead);
+        motion_desc.set_storage_mode(MTLStorageMode::Private);
+        let motion_texture = device.new_texture(&motion_desc);
+
+        let albedo_desc = TextureDescriptor::new();
+        albedo_desc.set_width(width as u64);
+        albedo_desc.set_height(height as u64);
+        albedo_desc.set_pixel_format(MTLPixelFormat::RGBA8Unorm);
+        albedo_desc.set_usage(MTLTextureUsage::ShaderWrite | MTLTextureUsage::ShaderRead);
+        albedo_desc.set_storage_mode(MTLStorageMode::Private);
+        let albedo_texture = device.new_texture(&albedo_desc);
+
+        // Per-frame state uniform: frame_count + prev_view_proj.
+        // Sized for PathStateUniform (80 bytes). Updated in place
+        // each render via the shared buffer's contents() pointer.
         let path_state_buffer = device.new_buffer(
-            std::mem::size_of::<u32>() as u64 * 4, // pad to 16 bytes for MSL alignment
+            std::mem::size_of::<PathStateUniform>() as u64,
             MTLResourceOptions::StorageModeShared,
         );
 
@@ -308,7 +386,12 @@ impl MetalRenderer {
             height,
             accum_texture,
             normal_texture,
+            depth_texture,
+            motion_texture,
+            albedo_texture,
             metalfx_scaler,
+            current_view_proj: None,
+            view_proj_history: None,
             frame_count: 0,
             path_state_buffer,
             accel: None,
@@ -330,8 +413,15 @@ impl MetalRenderer {
     /// Doesn't allocate -- just zeroes the frame counter so the
     /// kernel's "frame_count == 0" branch overwrites accumulation
     /// instead of reading-adding-writing.
+    ///
+    /// f.3.b: also clears the view-proj history so the next frame's
+    /// motion vectors are all zero (no valid history to project
+    /// against). MetalFX will then treat the next frame as
+    /// "fully new content", same as if the temporal denoiser just
+    /// started.
     pub fn reset_accumulation(&mut self) {
         self.frame_count = 0;
+        self.view_proj_history = None;
     }
 
     /// Apply editor-driven scene state. Rebuilds the acceleration
@@ -503,8 +593,14 @@ impl MetalRenderer {
             &lights_uniform.ambient[..3]
         );
 
-        // Camera uniform.
-        let cam_uniform = build_camera_uniform(&scene.camera, self.width, self.height);
+        // Camera uniform. update_scene also implicitly resets motion
+        // history (the path_state's prev_view_proj is shifted from
+        // the renderer's view_proj_history, which gets cleared by
+        // reset_accumulation -> first frame after a scene change has
+        // identity prev_view_proj -> kernel outputs zero motion).
+        let (cam_uniform, current_vp) =
+            build_camera_uniform(&scene.camera, self.width, self.height);
+        self.current_view_proj = Some(current_vp);
         let cam_buf = self.device.new_buffer_with_data(
             &cam_uniform as *const _ as *const c_void,
             std::mem::size_of::<CameraUniform>() as u64,
@@ -537,7 +633,9 @@ impl MetalRenderer {
     /// blur, not what we want).
     pub fn update_camera(&mut self, camera: &Camera) -> anyhow::Result<()> {
         self.reset_accumulation();
-        let cam_uniform = build_camera_uniform(camera, self.width, self.height);
+        let (cam_uniform, current_vp) =
+            build_camera_uniform(camera, self.width, self.height);
+        self.current_view_proj = Some(current_vp);
         if let Some(buf) = self.camera_buffer.as_ref() {
             // Shared-storage buffer -- contents() gives a CPU pointer
             // we can overwrite directly. Cheaper than reallocating.
@@ -732,27 +830,43 @@ impl MetalRenderer {
         let geom_off_buf = self.geom_offsets_buffer.as_ref().unwrap();
         let lights_buf = self.lights_buffer.as_ref().unwrap();
 
-        // Sprint 7.5.6.e -- update per-frame path-tracing state.
-        // path_state_buffer is shared storage so we patch the
+        // Sprint 7.5.6.e + f.3.b -- update per-frame path-tracing
+        // state. path_state_buffer is shared storage so we patch the
         // contents() pointer directly each frame; no reallocation.
-        // Layout matches the MSL PathState struct: { frame_count, pad
-        // pad, pad } -- the 12 trailing bytes are unused but reserved
-        // for future state (e.g. samples-per-frame, max-bounces).
+        // Contains the frame counter (RNG seed + accumulation
+        // denominator) plus the previous-frame view-projection
+        // (motion-vector projection in the path tracer's G-buffer
+        // output).
+        let prev_vp_for_motion = self.view_proj_history.unwrap_or(IDENTITY_VIEW_PROJ);
+        let pvp_cols: [[f32; 4]; 4] = [
+            [prev_vp_for_motion[0],  prev_vp_for_motion[1],  prev_vp_for_motion[2],  prev_vp_for_motion[3]],
+            [prev_vp_for_motion[4],  prev_vp_for_motion[5],  prev_vp_for_motion[6],  prev_vp_for_motion[7]],
+            [prev_vp_for_motion[8],  prev_vp_for_motion[9],  prev_vp_for_motion[10], prev_vp_for_motion[11]],
+            [prev_vp_for_motion[12], prev_vp_for_motion[13], prev_vp_for_motion[14], prev_vp_for_motion[15]],
+        ];
+        let path_state = PathStateUniform {
+            frame_count: self.frame_count,
+            _pad: [0; 3],
+            prev_view_proj: pvp_cols,
+        };
         unsafe {
-            let ptr = self.path_state_buffer.contents() as *mut u32;
-            ptr.write(self.frame_count);
+            let ptr = self.path_state_buffer.contents() as *mut PathStateUniform;
+            ptr.write(path_state);
         }
 
         let cb = self.queue.new_command_buffer();
 
         // ── Path-tracing dispatch ─────────────────────────────────
-        // Writes:  accum_texture (RGBA32F) + normal_texture (RGBA32F)
-        // The display texture is written by the SECOND (denoise) pass
-        // since the denoiser needs to blend neighbors before display.
+        // Writes:  accum_texture (RGBA32F) + normal (RGBA32F) +
+        //          depth (R32F) + motion (RG16F) + albedo (RGBA8U).
+        // The display texture is written by the SECOND (denoise) pass.
         let enc = cb.new_compute_command_encoder();
         enc.set_compute_pipeline_state(&self.pipeline);
         enc.set_texture(1, Some(&self.accum_texture));
         enc.set_texture(2, Some(&self.normal_texture));
+        enc.set_texture(3, Some(&self.depth_texture));
+        enc.set_texture(4, Some(&self.motion_texture));
+        enc.set_texture(5, Some(&self.albedo_texture));
         enc.set_acceleration_structure(0, Some(&**accel));
         enc.use_resource(&**accel, MTLResourceUsage::Read);
         enc.set_buffer(1, Some(cam_buf), 0);
@@ -800,6 +914,13 @@ impl MetalRenderer {
         // continuous accumulation; in practice every camera/light
         // tweak resets us long before that.
         self.frame_count = self.frame_count.saturating_add(1).min(16_000_000);
+
+        // f.3.b: shift the view-proj history. What we just rendered
+        // with (current_view_proj) becomes "what was used last frame"
+        // for the NEXT render's motion-vector computation.
+        if let Some(cvp) = self.current_view_proj {
+            self.view_proj_history = Some(cvp);
+        }
 
         let bytes_per_row = (self.width * 4) as u64;
         let mut pixels = vec![0u8; (self.width * self.height * 4) as usize];
@@ -985,25 +1106,54 @@ fn build_lights_uniform(lights: &[Light]) -> LightsUniform {
 
 /// Convert the editor's pos/target/up/fov camera into a precomputed
 /// orthonormal basis + tan(fov/2) + aspect tuple that the kernel can
-/// consume without any per-pixel cross() / normalize() work.
-fn build_camera_uniform(camera: &Camera, width: u32, height: u32) -> CameraUniform {
-    let eye = Vec3::from(camera.pos);
+/// consume without any per-pixel cross() / normalize() work. Also
+/// returns the *current* view-projection matrix so the caller can
+/// stash it on the renderer for next frame's motion-vector use
+/// (the matrix lives in path_state, not in CameraUniform itself,
+/// because path_state is rewritten every frame while CameraUniform
+/// is only rewritten on actual camera change).
+fn build_camera_uniform(
+    camera: &Camera,
+    width: u32,
+    height: u32,
+) -> (CameraUniform, [f32; 16]) {
+    use glam::Mat4;
+    let eye_v = Vec3::from(camera.pos);
     let target = Vec3::from(camera.target);
     let up_hint = Vec3::from(camera.up);
-    let forward = (target - eye).normalize_or_zero();
+    let forward = (target - eye_v).normalize_or_zero();
     let right = forward.cross(up_hint).normalize_or_zero();
     let up = right.cross(forward); // already unit-length
     let fov_rad = camera.fov_deg.to_radians();
     let tan_half_fov = (fov_rad * 0.5).tan();
     let aspect = (width as f32) / (height as f32).max(1.0);
-    CameraUniform {
-        eye: [eye.x, eye.y, eye.z, 1.0],
+
+    // Current view-projection for motion-vector use NEXT frame.
+    let view = Mat4::look_at_rh(eye_v, target, up_hint);
+    let proj = Mat4::perspective_rh(fov_rad, aspect, camera.near, camera.far);
+    let view_proj = proj * view;
+    let current_view_proj = view_proj.to_cols_array();
+
+    let uniform = CameraUniform {
+        eye: [eye_v.x, eye_v.y, eye_v.z, 1.0],
         right: [right.x, right.y, right.z, 0.0],
         up: [up.x, up.y, up.z, 0.0],
         forward: [forward.x, forward.y, forward.z, 0.0],
         misc: [tan_half_fov, aspect, 0.0, 0.0],
-    }
+    };
+    (uniform, current_view_proj)
 }
+
+/// Identity 4×4 column-major. Used as the initial "previous"
+/// view-projection on the very first frame, so motion vectors are
+/// effectively zero (no history yet -> MetalFX treats every pixel
+/// as new content for the first frame).
+const IDENTITY_VIEW_PROJ: [f32; 16] = [
+    1.0, 0.0, 0.0, 0.0,
+    0.0, 1.0, 0.0, 0.0,
+    0.0, 0.0, 1.0, 0.0,
+    0.0, 0.0, 0.0, 1.0,
+];
 
 /// One-shot test render: build a renderer, push a hard-coded test
 /// scene (since --render-test is invoked without an IPC client),

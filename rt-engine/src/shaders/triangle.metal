@@ -66,10 +66,16 @@ struct LightsUniform {
 };
 
 struct PathState {
-    uint frame_count;
-    uint pad0;
-    uint pad1;
-    uint pad2;
+    uint     frame_count;
+    uint     pad0;
+    uint     pad1;
+    uint     pad2;
+    // f.3.b -- previous frame's view*projection matrix (column-
+    // major). Path tracer projects current-frame opaque hit points
+    // through this to get last-frame screen UV, motion = current_uv -
+    // last_uv. 16-byte aligned at offset 16, matches the Rust
+    // PathStateUniform field after the 12-byte pad.
+    float4x4 prev_view_proj;
 };
 
 constant float PI = 3.14159265358979;
@@ -270,6 +276,10 @@ inline float3 shade_direct(
 kernel void rt_scene(
     texture2d<float, access::read_write> accumTex   [[texture(1)]],
     texture2d<float, access::write>     normalTex   [[texture(2)]],
+    // f.3.b G-buffers for MetalFX:
+    texture2d<float, access::write>     depthTex    [[texture(3)]],
+    texture2d<float, access::write>     motionTex   [[texture(4)]],
+    texture2d<float, access::write>     albedoTex   [[texture(5)]],
     primitive_acceleration_structure    accel       [[buffer(0)]],
     constant CameraUniform&  camera                 [[buffer(1)]],
     constant MaterialUniform* materials             [[buffer(2)]],
@@ -314,11 +324,18 @@ kernel void rt_scene(
     float3 sample     = float3(0.0);
     bool   terminated = false;
 
-    // Sprint 7.5.6.f -- track the primary-hit normal for the denoise
-    // G-buffer. Zero if we miss everything (sky pixel; denoiser
-    // treats it as "no neighbor blending").
-    float3 primary_normal = float3(0.0);
-    bool   primary_hit    = false;
+    // Sprint 7.5.6.f -- track the primary G-buffer values. Recorded
+    // at the FIRST OPAQUE hit (mirror/glass surfaces don't write
+    // their own G-buffer; whatever they ultimately reflect / refract
+    // INTO is the "perceived" content for that pixel). This is
+    // important for temporal denoising in f.3: motion vectors for
+    // mirror reflections track the underlying scene, not the mirror.
+    float3 primary_normal     = float3(0.0);
+    float3 primary_hit_point  = float3(0.0);
+    float3 primary_albedo     = float3(0.0);
+    float  primary_depth      = 0.0;  // total path length to opaque hit
+    bool   primary_recorded   = false;
+    float  accumulated_dist   = 0.0;  // virtual depth through mirrors / glass
 
     for (int bounce = 0; bounce < MAX_BOUNCES; bounce++) {
         intersection_result<triangle_data> hit = isr.intersect(r, accel);
@@ -354,17 +371,28 @@ kernel void rt_scene(
         const bool entering = ndotrd < NORMAL_FLIP_THR;
         float3 N = entering ? N_geom : -N_geom;
 
-        // Stash the primary-hit normal for the denoise G-buffer. We
-        // do this on the very first bounce only (the primary ray);
-        // subsequent bounces' normals are irrelevant for spatial
-        // denoising of the per-pixel color.
-        if (bounce == 0) {
-            primary_normal = N;
-            primary_hit    = true;
-        }
+        // Accumulate the virtual distance from the camera along the
+        // bounce path. For straight-through hits this is just the
+        // primary ray distance; for mirror/glass refractions it's
+        // the sum across all bounces ("virtual depth").
+        accumulated_dist += hit.distance;
 
         const MaterialUniform mat = materials[gid_hit];
         const uint mtype = mat.flags.x;
+
+        // Record the primary-hit G-buffer at the FIRST OPAQUE hit
+        // (mtypes 0, 1, 2 = Unlit / Phong / PBR). Mirror (3) and
+        // Glass (4) continue the path without writing G-buffer --
+        // the underlying opaque surface ends up here. Mirror/glass
+        // first bounces "fall through" to whatever they reflect.
+        const bool is_opaque = (mtype == 0u || mtype == 1u || mtype == 2u);
+        if (!primary_recorded && is_opaque) {
+            primary_normal    = N;
+            primary_hit_point = hit_point;
+            primary_albedo    = mat.albedo.xyz;
+            primary_depth     = accumulated_dist;
+            primary_recorded  = true;
+        }
 
         if (mtype == 3u) {
             // Mirror: continue with reflected ray. No direct lighting
@@ -477,15 +505,45 @@ kernel void rt_scene(
     }
     accumTex.write(float4(new_accum, 0.0), gid);
 
-    // Sprint 7.5.6.f -- write G-buffer for the denoise pass.
-    // .xyz = world-space normal at primary hit; .w = 1 if hit, 0 if
-    // miss (sky pixel). The denoiser uses .w to decide "neighbor is
-    // a valid blur source for me" and dot(N_self, N_neighbor) for the
-    // edge-stopping weight.
+    // ── G-buffer writes ───────────────────────────────────────────
+    // Normal: .xyz = world-space normal at primary opaque hit, .w =
+    // 1 if recorded / 0 if this pixel saw only sky (or only
+    // mirror/glass that escaped to sky).
     normalTex.write(
-        float4(primary_normal, primary_hit ? 1.0 : 0.0),
+        float4(primary_normal, primary_recorded ? 1.0 : 0.0),
         gid
     );
+
+    // f.3.b -- depth, motion vector, albedo for MetalFX.
+    // Depth: linear "virtual depth" through any mirrors/glass to
+    // the first opaque hit. 0 for sky pixels (could also use a
+    // very-large sentinel; MetalFX seems happy with 0 for sky).
+    depthTex.write(float4(primary_depth, 0.0, 0.0, 0.0), gid);
+
+    // Albedo: raw surface color before lighting (= material's base
+    // color). 0 for sky pixels.
+    albedoTex.write(float4(primary_albedo, 1.0), gid);
+
+    // Motion vector: where THIS pixel's content was in the PREVIOUS
+    // frame, in UV-space delta. Zero for:
+    //   - sky pixels (no opaque hit recorded)
+    //   - first frame after accumulation reset (frame == 0): no
+    //     valid history yet, MetalFX should treat as new content.
+    float2 motion = float2(0.0);
+    if (primary_recorded && frame > 0u) {
+        const float4 clip_prev = path.prev_view_proj
+                               * float4(primary_hit_point, 1.0);
+        if (abs(clip_prev.w) > 1e-5) {
+            // NDC = clip / w; UV = NDC * 0.5 + 0.5. Flip Y because
+            // Metal's texture origin is top-left but NDC Y is up.
+            float2 ndc_prev = clip_prev.xy / clip_prev.w;
+            float2 uv_prev  = float2(ndc_prev.x * 0.5 + 0.5,
+                                      1.0 - (ndc_prev.y * 0.5 + 0.5));
+            float2 uv_cur   = (float2(gid) + 0.5) / float2(float(w), float(h));
+            motion = uv_cur - uv_prev;
+        }
+    }
+    motionTex.write(float4(motion.x, motion.y, 0.0, 0.0), gid);
 
     // No display write here -- rt_denoise reads accumTex + normalTex
     // and produces the final display output in its own kernel pass.
