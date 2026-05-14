@@ -405,33 +405,58 @@ kernel void rt_scene(
         const MaterialUniform mat = materials[gid_hit];
         const uint mtype = mat.flags.x;
 
-        // Record the primary-hit G-buffer at the FIRST OPAQUE hit
-        // (mtypes 0, 1, 2 = Unlit / Phong / PBR). Mirror (3) and
-        // Glass (4) continue the path without writing G-buffer --
-        // the underlying opaque surface ends up here. Mirror/glass
-        // first bounces "fall through" to whatever they reflect.
+        // Record the primary-hit G-buffer at the FIRST hit that's
+        // "denoising-stable" -- meaning its world point and surface
+        // properties don't change between frames for a given camera.
+        // That includes:
+        //   - opaque surfaces (mtypes 0, 1, 2): obviously stable
+        //   - glass (mtype 4): the GLASS SURFACE itself is stable;
+        //     it's the random Fresnel-branched path that flickers,
+        //     and we want MetalFX to denoise that flickering color
+        //     against a stable G-buffer.
+        // Mirrors (mtype 3) are NOT denoising-stable at their own
+        // surface (perfectly reflective, no own appearance) so we
+        // keep falling through to whatever they reflect into.
         const bool is_opaque = (mtype == 0u || mtype == 1u || mtype == 2u);
-        if (!primary_recorded && is_opaque) {
+        const bool is_glass  = (mtype == 4u);
+        if (!primary_recorded && (is_opaque || is_glass)) {
             primary_normal    = N;
             primary_hit_point = hit_point;
-            primary_albedo    = mat.albedo.xyz;
             primary_depth     = accumulated_dist;
-            // f.3.d-fix4 -- record roughness + specular F0 for MetalFX
-            // auxiliary inputs. mat.params layout: x=metallic,
-            // y=roughness, z=shininess, w=ambient (see CPU-side
-            // MaterialUniform). For Unlit (mtype 0) treat roughness
-            // as 1.0 (no specular concentration) since Unlit has no
-            // notion of glossiness.
-            const float met = (mtype == 0u) ? 0.0 : mat.params.x;
-            const float rgh = (mtype == 0u) ? 1.0 : mat.params.y;
-            primary_roughness = rgh;
-            // F0 (Fresnel at 0 deg): dielectric ~0.04, metallic = albedo.
-            // Apple's WWDC25 specifically calls out that for metallic
-            // surfaces, the COLORED component lives in specular albedo
-            // and diffuse should be darker. We pass the standard
-            // lerp here -- our diffuse albedo will be slightly bright
-            // for metals but the denoiser tolerates that.
-            primary_specular  = mix(float3(0.04), mat.albedo.xyz, met);
+            if (is_glass) {
+                // f.3.d-fix5 -- record G-buffer AT the glass surface
+                // (not through it). Before this, glass pixels'
+                // G-buffer flickered between whatever the reflect /
+                // refract branch ended up hitting, and MetalFX's
+                // history rejection killed every glass pixel forever.
+                //
+                // Mark glass as "smooth dielectric": diffuse albedo
+                // mostly white (light passes through with little
+                // chromatic shift for clear glass), roughness 0
+                // (sharp specular response), F0 ≈ 0.04 (IOR ≈ 1.5
+                // dielectric). The noisy COLOR signal still encodes
+                // the Fresnel-mixed reflect/refract content; MetalFX
+                // averages it temporally against this stable surface.
+                primary_albedo    = float3(0.9);
+                primary_roughness = 0.0;
+                primary_specular  = float3(0.04);
+            } else {
+                primary_albedo    = mat.albedo.xyz;
+                // f.3.d-fix4 -- mat.params layout: x=metallic,
+                // y=roughness, z=shininess, w=ambient. For Unlit
+                // (mtype 0) treat roughness as 1.0 (no specular
+                // concentration) since Unlit has no glossiness.
+                const float met = (mtype == 0u) ? 0.0 : mat.params.x;
+                const float rgh = (mtype == 0u) ? 1.0 : mat.params.y;
+                primary_roughness = rgh;
+                // F0 (Fresnel at 0 deg): dielectric ~0.04, metallic
+                // = albedo. WWDC25 calls out that for metallic
+                // surfaces the COLORED component lives in specular
+                // albedo and diffuse should be darker. We use the
+                // standard lerp -- diffuse will be slightly bright
+                // for metals but the denoiser tolerates it.
+                primary_specular  = mix(float3(0.04), mat.albedo.xyz, met);
+            }
             primary_recorded  = true;
         }
 
