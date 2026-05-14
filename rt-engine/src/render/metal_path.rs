@@ -681,10 +681,27 @@ fn material_to_uniform(m: &Material) -> MaterialUniform {
             params: [*metallic, roughness.max(0.04), 0.0, 0.0],
             flags: [2, 0, 0, 0],
         },
-        Material::Glass { color, .. }
-        | Material::Mirror { tint: color }
-        | Material::Shader { color, .. } => MaterialUniform {
-            // c-2 fallback: render as Unlit with the base color.
+        Material::Mirror { tint } => MaterialUniform {
+            albedo: [tint[0], tint[1], tint[2], 0.0],
+            params: [0.0; 4],
+            // Type tag 3 = Mirror (c-3 added Glass=4 alongside).
+            flags: [3, 0, 0, 0],
+        },
+        Material::Glass {
+            color,
+            ior,
+            absorption: _,  // absorption param could feed Beer-Lambert in
+                            // a future pass; c-d v1 uses `color` as
+                            // a per-bounce multiplicative tint instead.
+        } => MaterialUniform {
+            albedo: [color[0], color[1], color[2], 0.0],
+            // .x = ior (index of refraction). .y/.z/.w unused for glass.
+            params: [*ior, 0.0, 0.0, 0.0],
+            flags: [4, 0, 0, 0],
+        },
+        Material::Shader { color, .. } => MaterialUniform {
+            // ShaderMat fallback: render as Unlit with the base color.
+            // (Slang transpile is a long-running future item.)
             albedo: [color[0], color[1], color[2], 0.0],
             params: [0.0; 4],
             flags: [0, 0, 0, 0],
