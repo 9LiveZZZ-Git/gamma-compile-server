@@ -221,6 +221,14 @@ pub struct MetalRenderer {
     // temporal blend doesn't quantize. A separate tonemap kernel
     // then converts to RGBA8 for the display.
     metalfx_output_texture: Texture,
+    // f.3.d-fix4 -- additional G-buffers required by MetalFX's
+    // denoised scaler (per WWDC25 §211 "Go further with Metal 4
+    // games"). Without these the denoiser receives uninitialized
+    // auxiliary inputs and never converges on static scenes.
+    //   roughness_texture: R16Float, [0,1], 1.0 = fully diffuse
+    //   specular_albedo_texture: RGBA16F, F0 (Fresnel @ 0 deg)
+    roughness_texture: Texture,
+    specular_albedo_texture: Texture,
     // Sprint 7.5.6.f.3 -- MetalFX TemporalDenoisedScaler. Apple's
     // neural-net temporal denoiser for path-traced rendering. None
     // if creation failed (older macOS, unsupported GPU, or build
@@ -387,6 +395,29 @@ impl MetalRenderer {
         fxout_desc.set_storage_mode(MTLStorageMode::Private);
         let metalfx_output_texture = device.new_texture(&fxout_desc);
 
+        // f.3.d-fix4 -- roughness + specular albedo G-buffers,
+        // required auxiliary inputs for the denoised scaler.
+        // Roughness is a single channel in [0,1]; R16Float gives
+        // ~11 bits of mantissa over that range, plenty for the
+        // denoiser's smooth-vs-rough classification. Specular albedo
+        // is per-channel F0, kept at RGBA16F to match the rest of
+        // the HDR pipeline.
+        let rough_desc = TextureDescriptor::new();
+        rough_desc.set_width(width as u64);
+        rough_desc.set_height(height as u64);
+        rough_desc.set_pixel_format(MTLPixelFormat::R16Float);
+        rough_desc.set_usage(MTLTextureUsage::ShaderWrite | MTLTextureUsage::ShaderRead);
+        rough_desc.set_storage_mode(MTLStorageMode::Private);
+        let roughness_texture = device.new_texture(&rough_desc);
+
+        let spec_desc = TextureDescriptor::new();
+        spec_desc.set_width(width as u64);
+        spec_desc.set_height(height as u64);
+        spec_desc.set_pixel_format(MTLPixelFormat::RGBA16Float);
+        spec_desc.set_usage(MTLTextureUsage::ShaderWrite | MTLTextureUsage::ShaderRead);
+        spec_desc.set_storage_mode(MTLStorageMode::Private);
+        let specular_albedo_texture = device.new_texture(&spec_desc);
+
         // Tonemap pipeline (RGBA16F MetalFX output -> RGBA8 display).
         let tonemap_func = lib
             .get_function("rt_tonemap", None)
@@ -455,6 +486,8 @@ impl MetalRenderer {
             albedo_texture,
             noisy_color_texture,
             metalfx_output_texture,
+            roughness_texture,
+            specular_albedo_texture,
             metalfx_scaler,
             tonemap_pipeline,
             current_view_proj: None,
@@ -942,6 +975,11 @@ impl MetalRenderer {
         enc.set_texture(4, Some(&self.motion_texture));
         enc.set_texture(5, Some(&self.albedo_texture));
         enc.set_texture(6, Some(&self.noisy_color_texture));
+        // f.3.d-fix4 -- bind roughness (slot 7) + specular albedo
+        // (slot 8) G-buffers. The kernel writes them at the primary
+        // opaque hit; MetalFX reads them as auxiliary inputs.
+        enc.set_texture(7, Some(&self.roughness_texture));
+        enc.set_texture(8, Some(&self.specular_albedo_texture));
         enc.set_acceleration_structure(0, Some(&**accel));
         enc.use_resource(&**accel, MTLResourceUsage::Read);
         enc.set_buffer(1, Some(cam_buf), 0);
@@ -975,14 +1013,19 @@ impl MetalRenderer {
             scaler.set_motion_texture(&self.motion_texture);
             scaler.set_normal_texture(&self.normal_texture);
             scaler.set_diffuse_albedo_texture(&self.albedo_texture);
+            // f.3.d-fix4 -- newly required auxiliary textures.
+            // Without these the denoiser silently uses uninitialized
+            // buffers and never converges on static scenes.
+            scaler.set_roughness_texture(&self.roughness_texture);
+            scaler.set_specular_albedo_texture(&self.specular_albedo_texture);
             scaler.set_output_texture(&self.metalfx_output_texture);
-            // f.3.d-fix3 -- colorProcessingMode is a DESCRIPTOR
-            // property, not a per-frame scaler property. Setting it
-            // on the scaler at runtime throws "unrecognized selector"
-            // -> ObjC exception -> Rust abort. It's now configured
-            // once in TemporalDenoisedScaler::try_new via the
-            // descriptor.
-            //
+            // f.3.d-fix4 -- depthReversed. Apple defaults to YES
+            // (reverse-Z); our depth texture stores LINEAR world-
+            // space distance from the camera. If we don't flip this
+            // flag, MetalFX interprets near pixels as far and vice
+            // versa -> history-validation fails everywhere ->
+            // permanent noise (which matches the observed symptom).
+            scaler.set_depth_reversed(false);
             // Reset = true on frame 0 after a reset_accumulation so
             // MetalFX drops its temporal history and starts fresh.
             scaler.set_reset(self.frame_count == 0);
@@ -991,14 +1034,32 @@ impl MetalRenderer {
                 self.width as f32,
                 self.height as f32,
             );
-            // f.3.d -- Halton sub-pixel jitter, centered around 0
-            // (kernel uses jitter in [0, 1] starting from pixel
-            // top-left; MetalFX wants jitter in [-0.5, 0.5] relative
-            // to pixel center). Same value the path tracer used for
-            // this frame's primary ray offset; lets MetalFX
-            // correlate sub-pixel samples across frames for AA +
-            // proper static-scene convergence.
-            scaler.set_jitter_offset(jitter_x - 0.5, jitter_y - 0.5);
+            // f.3.d / f.3.d-fix4 -- Halton sub-pixel jitter, centered
+            // around 0. Kernel samples at (gid + jitter) in [0, 1]
+            // from pixel top-left; MetalFX wants jitter in [-0.5,
+            // 0.5] relative to pixel center. Apple's WWDC25 sample
+            // explicitly NEGATES the Y component:
+            //     scaler.jitterOffsetY = -pixelJitter.y;
+            // because MetalFX's Y is "up" while Metal texture Y is
+            // "down". Without the negation, MetalFX reprojects this
+            // frame's samples to the WRONG sub-pixel offset across
+            // frames -> no temporal accumulation -> stays noisy.
+            scaler.set_jitter_offset(jitter_x - 0.5, -(jitter_y - 0.5));
+
+            // Debug telemetry: per-frame state visible to whoever's
+            // diagnosing the next round of MetalFX issues. Gated on
+            // RUST_LOG=debug so production runs stay quiet.
+            log::debug!(
+                "[metalfx] frame={} reset={} jitter=({:.3},{:.3}) \
+                 jitter_mfx=({:.3},{:.3}) motion_scale=({},{}) \
+                 prev_vp={} depth_reversed=false",
+                self.frame_count,
+                self.frame_count == 0,
+                jitter_x, jitter_y,
+                jitter_x - 0.5, -(jitter_y - 0.5),
+                self.width, self.height,
+                if self.view_proj_history.is_some() { "valid" } else { "identity" },
+            );
 
             scaler.encode_to_command_buffer(cb);
 

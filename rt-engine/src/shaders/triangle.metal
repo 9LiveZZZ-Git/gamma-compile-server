@@ -288,6 +288,12 @@ kernel void rt_scene(
     // vectors. The engine-side accumulation (accumTex) is kept for
     // the spatial-denoiser fallback path.
     texture2d<float, access::write>     noisyColorTex [[texture(6)]],
+    // f.3.d-fix4 -- roughness + specular-albedo G-buffers REQUIRED by
+    // MTLFXTemporalDenoisedScaler. Without these the scaler doesn't
+    // know which pixels need aggressive denoising vs which are sharp,
+    // and temporal blending refuses to converge on static scenes.
+    texture2d<float, access::write>     roughnessTex    [[texture(7)]],
+    texture2d<float, access::write>     specAlbedoTex   [[texture(8)]],
     primitive_acceleration_structure    accel       [[buffer(0)]],
     constant CameraUniform&  camera                 [[buffer(1)]],
     constant MaterialUniform* materials             [[buffer(2)]],
@@ -346,6 +352,13 @@ kernel void rt_scene(
     float3 primary_hit_point  = float3(0.0);
     float3 primary_albedo     = float3(0.0);
     float  primary_depth      = 0.0;  // total path length to opaque hit
+    // f.3.d-fix4 -- additional G-buffer values required by MetalFX's
+    // denoised scaler. Roughness drives the denoiser's sharpness vs
+    // smoothness decision per pixel; specular albedo (F0) drives the
+    // separation between diffuse and specular paths. Recorded at the
+    // primary OPAQUE hit, same as the rest.
+    float  primary_roughness    = 1.0;  // fully rough default = treat as diffuse
+    float3 primary_specular     = float3(0.04);  // dielectric F0 default
     bool   primary_recorded   = false;
     float  accumulated_dist   = 0.0;  // virtual depth through mirrors / glass
 
@@ -403,6 +416,22 @@ kernel void rt_scene(
             primary_hit_point = hit_point;
             primary_albedo    = mat.albedo.xyz;
             primary_depth     = accumulated_dist;
+            // f.3.d-fix4 -- record roughness + specular F0 for MetalFX
+            // auxiliary inputs. mat.params layout: x=metallic,
+            // y=roughness, z=shininess, w=ambient (see CPU-side
+            // MaterialUniform). For Unlit (mtype 0) treat roughness
+            // as 1.0 (no specular concentration) since Unlit has no
+            // notion of glossiness.
+            const float met = (mtype == 0u) ? 0.0 : mat.params.x;
+            const float rgh = (mtype == 0u) ? 1.0 : mat.params.y;
+            primary_roughness = rgh;
+            // F0 (Fresnel at 0 deg): dielectric ~0.04, metallic = albedo.
+            // Apple's WWDC25 specifically calls out that for metallic
+            // surfaces, the COLORED component lives in specular albedo
+            // and diffuse should be darker. We pass the standard
+            // lerp here -- our diffuse albedo will be slightly bright
+            // for metals but the denoiser tolerates that.
+            primary_specular  = mix(float3(0.04), mat.albedo.xyz, met);
             primary_recorded  = true;
         }
 
@@ -547,6 +576,14 @@ kernel void rt_scene(
     // Albedo: raw surface color before lighting (= material's base
     // color). 0 for sky pixels.
     albedoTex.write(float4(primary_albedo, 1.0), gid);
+
+    // f.3.d-fix4 -- roughness + specular albedo G-buffers for
+    // MetalFX's denoised scaler. Sky / pure-glass pixels keep the
+    // defaults (roughness=1, F0=0.04) which read as "fully diffuse
+    // dielectric" -- correct for the sky envelope, conservative for
+    // glass-through pixels.
+    roughnessTex.write(float4(primary_roughness, 0.0, 0.0, 0.0), gid);
+    specAlbedoTex.write(float4(primary_specular, 1.0), gid);
 
     // Motion vector: vector pointing FROM the current pixel TO where
     // this pixel's content was in the PREVIOUS frame, in UV space.

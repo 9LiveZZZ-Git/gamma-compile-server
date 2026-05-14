@@ -90,13 +90,17 @@ pub struct ScalerConfig {
     pub normal_format: MTLPixelFormat,
     /// Diffuse albedo. RGBA8Unorm (sRGB-space color).
     pub diffuse_albedo_format: MTLPixelFormat,
-    /// MTLFXTemporalScalerColorProcessingMode (set on the descriptor
-    /// at scaler creation time; can't be changed per-frame).
-    ///   0 = PerceptualLDR  (gamma-encoded sRGB in [0,1])
-    ///   1 = Linear         (linear-encoded in [0,1])
-    ///   2 = HDR            (linear, unbounded -- what we want for
-    ///                       path-traced RGBA16Float color input)
-    pub color_processing_mode: u64,
+    /// f.3.d-fix4 -- Roughness. R16Float. REQUIRED by the denoised
+    /// scaler per WWDC25 §211: without this the auxiliary buffer is
+    /// uninitialized and the denoiser can't separate sharp / smooth
+    /// surfaces, producing perpetual residual noise on static scenes.
+    pub roughness_format: MTLPixelFormat,
+    /// f.3.d-fix4 -- Specular albedo. RGBA16Float. REQUIRED. Noise-
+    /// free F0 (Fresnel @ 0°) per material; for metals this is the
+    /// albedo, for dielectrics ≈ (0.04, 0.04, 0.04). Missing this
+    /// causes the same "stays noisy forever" failure mode as missing
+    /// roughness.
+    pub specular_albedo_format: MTLPixelFormat,
 }
 
 impl Default for ScalerConfig {
@@ -112,7 +116,8 @@ impl Default for ScalerConfig {
             motion_format: MTLPixelFormat::RG16Float,
             normal_format: MTLPixelFormat::RGBA16Float,
             diffuse_albedo_format: MTLPixelFormat::RGBA8Unorm,
-            color_processing_mode: 2, // HDR
+            roughness_format: MTLPixelFormat::R16Float,
+            specular_albedo_format: MTLPixelFormat::RGBA16Float,
         }
     }
 }
@@ -156,31 +161,19 @@ impl TemporalDenoisedScaler {
             let _: () = msg_send![desc, setMotionTextureFormat: cfg.motion_format as u64];
             let _: () = msg_send![desc, setNormalTextureFormat: cfg.normal_format as u64];
             let _: () = msg_send![desc, setDiffuseAlbedoTextureFormat: cfg.diffuse_albedo_format as u64];
+            // f.3.d-fix4 -- roughness + specular albedo formats.
+            // These are REQUIRED auxiliary inputs per WWDC25 §211.
+            // Omitting them silently leaves their texture properties
+            // unbound on the scaler, which (in our testing) reads as
+            // "default" auxiliary buffers and produces never-
+            // converging noise on static scenes.
+            let _: () = msg_send![desc, setRoughnessTextureFormat: cfg.roughness_format as u64];
+            let _: () = msg_send![desc, setSpecularAlbedoTextureFormat: cfg.specular_albedo_format as u64];
 
-            // Color processing mode lives on the DESCRIPTOR, not on
-            // the scaler instance. Setting it on the scaler at
-            // runtime throws an "unrecognized selector" ObjC exception
-            // -- which Rust can't catch and which aborts the process.
-            // So we set it here, at creation. f.3.d-fix3.
-            //
-            // We guard with respondsToSelector: because the descriptor
-            // class might be different between macOS versions; on
-            // older SDKs the property may live on a different
-            // descriptor or not exist at all. In that case the scaler
-            // falls back to its default mode (which is documented as
-            // PerceptualLDR for the temporal scaler but appears to be
-            // Linear for the denoised one -- close enough to HDR for
-            // our 16F input that the denoiser still works).
-            let responds_color_mode: BOOL = msg_send![
-                desc,
-                respondsToSelector: sel!(setColorProcessingMode:)
-            ];
-            if responds_color_mode != NO {
-                let _: () = msg_send![
-                    desc,
-                    setColorProcessingMode: cfg.color_processing_mode
-                ];
-            }
+            // (Note: `colorProcessingMode` is NOT a property on the
+            // denoised scaler descriptor -- it's a SPATIAL scaler
+            // property only. Setting it here would silently no-op via
+            // respondsToSelector. We don't bother trying anymore.)
 
             // 3. [descriptor newTemporalDenoisedScalerWithDevice:device]
             //    -- returns nil if the device doesn't support it
@@ -197,6 +190,30 @@ impl TemporalDenoisedScaler {
             if scaler.is_null() {
                 return Ok(None);
             }
+
+            // f.3.d-fix4 -- one-shot probe of which auxiliary selectors
+            // the runtime scaler actually exposes. If any of these come
+            // back NO it means we're on an older SDK where the property
+            // was renamed / unavailable, and the denoiser is operating
+            // in degraded mode. Useful enough to surface at INFO since
+            // it explains future "stays noisy" reports concretely.
+            let resp_rough: BOOL = msg_send![
+                scaler,
+                respondsToSelector: sel!(setRoughnessTexture:)
+            ];
+            let resp_spec: BOOL = msg_send![
+                scaler,
+                respondsToSelector: sel!(setSpecularAlbedoTexture:)
+            ];
+            let resp_dr: BOOL = msg_send![
+                scaler,
+                respondsToSelector: sel!(setDepthReversed:)
+            ];
+            log::info!(
+                "[metalfx] selector probe: roughness={} specularAlbedo={} depthReversed={}",
+                resp_rough != NO, resp_spec != NO, resp_dr != NO,
+            );
+
             Ok(Some(TemporalDenoisedScaler {
                 ptr: scaler,
                 input_width: cfg.input_width,
@@ -249,6 +266,41 @@ impl TemporalDenoisedScaler {
         unsafe {
             let p = texture_to_ptr(tex);
             let _: () = msg_send![self.ptr, setOutputTexture: p];
+        }
+    }
+    /// f.3.d-fix4 -- Roughness texture (single channel float in [0,1]).
+    /// Required by the denoised scaler; the kernel writes this at the
+    /// primary opaque hit (same place we record depth/normal/albedo).
+    pub fn set_roughness_texture(&self, tex: &metal::Texture) {
+        unsafe {
+            let p = texture_to_ptr(tex);
+            let _: () = msg_send![self.ptr, setRoughnessTexture: p];
+        }
+    }
+    /// f.3.d-fix4 -- Specular albedo texture (RGBA, "noise free
+    /// approximation of specular radiance including Fresnel" per
+    /// Apple's WWDC25 talk). We approximate as F0 = lerp(0.04, albedo,
+    /// metallic) for opaque materials, ignored at the primary hit for
+    /// mirror/glass since those are recorded at their first opaque
+    /// underlying hit.
+    pub fn set_specular_albedo_texture(&self, tex: &metal::Texture) {
+        unsafe {
+            let p = texture_to_ptr(tex);
+            let _: () = msg_send![self.ptr, setSpecularAlbedoTexture: p];
+        }
+    }
+
+    /// f.3.d-fix4 -- depthReversed flag. Apple's MetalFX default
+    /// expects reverse-Z depth (1.0 = near, 0.0 = far). Our depth
+    /// texture stores LINEAR world-space distance from camera (0 at
+    /// the eye, increasing with distance) so we must explicitly tell
+    /// the scaler "not reversed". Otherwise it interprets our depth
+    /// upside-down -> history-validation tests all fail -> no
+    /// temporal accumulation -> permanent residual noise.
+    pub fn set_depth_reversed(&self, reversed: bool) {
+        let b: BOOL = if reversed { YES } else { NO };
+        unsafe {
+            let _: () = msg_send![self.ptr, setDepthReversed: b];
         }
     }
 
@@ -319,7 +371,6 @@ fn device_to_ptr(device: &Device) -> *mut Object {
     r.as_ptr() as *mut Object
 }
 
-// Silence "imported but unused" complaints from the BOOL / YES / NO
-// imports -- f.3.c will use them for the `reset` setter.
-const _: BOOL = YES;
-const _: BOOL = NO;
+// (BOOL / YES / NO are now used by set_reset, set_depth_reversed, and
+// the f.3.d-fix4 selector-probe at the end of try_new -- no more
+// silencer consts needed.)
