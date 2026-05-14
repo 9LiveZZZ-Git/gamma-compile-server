@@ -575,12 +575,12 @@ fn build_lights_uniform(lights: &[Light]) -> LightsUniform {
             intensity,
         } = light
         {
-            // Editor convention: `direction` is the direction light rays
-            // travel (e.g. (0,-1,0) for sun overhead). For Lambert we
-            // want the vector FROM the surface TO the light source =
-            // -direction. Negate on the CPU; kernel just dots N with
-            // dirs[i].xyz directly.
-            let d = -Vec3::from(*direction).normalize_or_zero();
+            // Editor convention (matches raster path): `direction` is
+            // the direction FROM the surface TOWARD the light source
+            // -- e.g. (0,1,0) means "light directly overhead, rays
+            // shine downward onto surface". For Lambert we use this
+            // vector directly: `dot(N, dirs[i].xyz)`. No CPU negation.
+            let d = Vec3::from(*direction).normalize_or_zero();
             packed.push((d, *color, *intensity));
             if packed.len() >= 4 {
                 break;
@@ -590,10 +590,11 @@ fn build_lights_uniform(lights: &[Light]) -> LightsUniform {
         // evaluation per-type in the kernel.
     }
     if packed.is_empty() {
-        // Default sunlit angle. Warm color, mid intensity. Looks fine
-        // for any scene with shaded materials wired up.
-        let d = -Vec3::new(-0.3, -0.8, -0.4).normalize();
-        packed.push((d, [1.0, 0.95, 0.85], 1.0));
+        // Default sunlit angle (matches the DirectionalLight node's
+        // registry defaults: upper-right-front, warm white). Looks
+        // fine for any scene with shaded materials wired up.
+        let d = Vec3::new(0.3, 1.0, 0.4).normalize();
+        packed.push((d, [1.0, 0.98, 0.92], 1.0));
     }
 
     let mut dirs = [[0.0f32; 4]; 4];
