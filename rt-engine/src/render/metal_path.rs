@@ -303,15 +303,16 @@ impl MetalRenderer {
         accum_desc.set_storage_mode(MTLStorageMode::Private);
         let accum_texture = device.new_texture(&accum_desc);
 
-        // Sprint 7.5.6.f -- normal G-buffer. Same shape as accum;
-        // the path tracer writes the primary-hit normal here, the
-        // denoise kernel reads it for edge-stopping. RGBA32F to keep
-        // full float precision (cosine-similarity weights below
-        // benefit from this).
+        // Sprint 7.5.6.f -- normal G-buffer. f.3.c: format changed
+        // from RGBA32Float to RGBA16Float to match the MetalFX
+        // scaler's normalTextureFormat. 16-bit float is plenty for
+        // normals (15 bits per component = ~1/32k precision, way
+        // more than the [-1, 1] range needs). Saves memory + makes
+        // MetalFX happy.
         let normal_desc = TextureDescriptor::new();
         normal_desc.set_width(width as u64);
         normal_desc.set_height(height as u64);
-        normal_desc.set_pixel_format(MTLPixelFormat::RGBA32Float);
+        normal_desc.set_pixel_format(MTLPixelFormat::RGBA16Float);
         normal_desc.set_usage(MTLTextureUsage::ShaderWrite | MTLTextureUsage::ShaderRead);
         normal_desc.set_storage_mode(MTLStorageMode::Private);
         let normal_texture = device.new_texture(&normal_desc);
