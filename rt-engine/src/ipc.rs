@@ -26,6 +26,7 @@
 use crate::backend::BackendKind;
 use crate::capability::Capabilities;
 use crate::render::Renderer;
+use crate::scene::{Camera, Scene};
 use anyhow::Context;
 use futures_util::{SinkExt, StreamExt};
 use log::{info, warn};
@@ -37,7 +38,6 @@ use tokio_tungstenite::tungstenite::Message;
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
-#[allow(dead_code)] // Scene / Params field bodies are part 2d work.
 enum ClientMsg {
     Hello,
     Configure { width: u32, height: u32 },
@@ -113,11 +113,15 @@ async fn handle_connection(
 
     // Per-connection rendering state. Renderer is built lazily on
     // first render-start so a client that only does --probe-style
-    // hello+shutdown doesn't pay the GPU init cost.
+    // hello+shutdown doesn't pay the GPU init cost. Scene + camera
+    // updates that arrive before the renderer is built are buffered
+    // here and applied on creation.
     let mut renderer: Option<Renderer> = None;
     let mut rendering = false;
     let mut want_dims = (DEFAULT_WIDTH, DEFAULT_HEIGHT);
     let mut frame_counter: u64 = 0;
+    let mut pending_scene: Option<Scene> = None;
+    let mut pending_camera: Option<Camera> = None;
 
     let mut tick = tokio::time::interval(Duration::from_millis(TARGET_FRAME_INTERVAL_MS));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -142,6 +146,8 @@ async fn handle_connection(
                     &mut renderer,
                     &mut rendering,
                     &mut want_dims,
+                    &mut pending_scene,
+                    &mut pending_camera,
                 ).await? {
                     // Returned false = clean shutdown requested.
                     return Ok(());
@@ -155,7 +161,22 @@ async fn handle_connection(
                     .unwrap_or(true);
                 if need_new {
                     match Renderer::new(want_dims.0, want_dims.1) {
-                        Ok(r) => {
+                        Ok(mut r) => {
+                            // Apply any scene / camera state that
+                            // arrived BEFORE the renderer was built.
+                            // Order: scene first (which also seeds
+                            // the camera uniform), then any newer
+                            // camera-only patch on top.
+                            if let Some(scene) = pending_scene.take() {
+                                if let Err(e) = r.update_scene(&scene) {
+                                    warn!("[stream] pending update_scene failed: {}", e);
+                                }
+                            }
+                            if let Some(cam) = pending_camera.take() {
+                                if let Err(e) = r.update_camera(&cam) {
+                                    warn!("[stream] pending update_camera failed: {}", e);
+                                }
+                            }
                             // Notify client of the actual stream
                             // dimensions (defaults if no configure
                             // was sent).
@@ -227,6 +248,8 @@ async fn handle_client_msg(
     renderer: &mut Option<Renderer>,
     rendering: &mut bool,
     want_dims: &mut (u32, u32),
+    pending_scene: &mut Option<Scene>,
+    pending_camera: &mut Option<Camera>,
 ) -> anyhow::Result<bool> {
     match msg {
         Message::Text(text) => {
@@ -246,6 +269,69 @@ async fn handle_client_msg(
                     // Force renderer rebuild on next tick if rendering.
                     *renderer = None;
                 }
+                Ok(ClientMsg::Scene { patch }) => {
+                    // Sprint 7.5.6.a part 2e-1 -- full scene replace.
+                    // Editor sends one of these after configure +
+                    // before render-start; the engine builds a fresh
+                    // AS from the mesh set and uploads camera/colors.
+                    match serde_json::from_value::<Scene>(patch) {
+                        Ok(scene) => {
+                            info!(
+                                "[stream] scene: {} mesh(es), camera@{:?}",
+                                scene.meshes.len(),
+                                scene.camera.pos
+                            );
+                            if let Some(r) = renderer.as_mut() {
+                                if let Err(e) = r.update_scene(&scene) {
+                                    warn!("[stream] update_scene failed: {}", e);
+                                    let msg = format!("{}", e);
+                                    let err = EngineMsg::Error {
+                                        where_: "scene",
+                                        message: &msg,
+                                    };
+                                    tx.send(Message::Text(serde_json::to_string(&err)?.into())).await?;
+                                }
+                            } else {
+                                // Renderer not yet built -- buffer
+                                // until first render-start tick.
+                                *pending_scene = Some(scene);
+                            }
+                        }
+                        Err(e) => {
+                            warn!("[stream] scene parse failed: {}", e);
+                            let msg = format!("invalid scene patch: {}", e);
+                            let err = EngineMsg::Error {
+                                where_: "scene-parse",
+                                message: &msg,
+                            };
+                            tx.send(Message::Text(serde_json::to_string(&err)?.into())).await?;
+                        }
+                    }
+                }
+                Ok(ClientMsg::Params { patch }) => {
+                    // Sprint 7.5.6.a part 2e-1 -- partial update.
+                    // Currently the only patch field supported is
+                    // "camera" (for live orbit / pose changes that
+                    // shouldn't trigger an AS rebuild). Other fields
+                    // ignored silently for now; 2e-2 expands the
+                    // coverage to per-mesh transforms + materials.
+                    if let Some(cam_val) = patch.get("camera") {
+                        match serde_json::from_value::<Camera>(cam_val.clone()) {
+                            Ok(cam) => {
+                                if let Some(r) = renderer.as_mut() {
+                                    if let Err(e) = r.update_camera(&cam) {
+                                        warn!("[stream] update_camera failed: {}", e);
+                                    }
+                                } else {
+                                    *pending_camera = Some(cam);
+                                }
+                            }
+                            Err(e) => {
+                                warn!("[stream] camera-params parse failed: {}", e);
+                            }
+                        }
+                    }
+                }
                 Ok(ClientMsg::RenderStart) => {
                     *rendering = true;
                     info!("[stream] render-start (dims {}x{})", want_dims.0, want_dims.1);
@@ -257,15 +343,6 @@ async fn handle_client_msg(
                 Ok(ClientMsg::Shutdown) => {
                     info!("[stream] shutdown requested");
                     return Ok(false);
-                }
-                Ok(ClientMsg::Scene { .. }) | Ok(ClientMsg::Params { .. }) => {
-                    // Scene state updates land in part 2d. For now the
-                    // engine renders its hard-coded triangle regardless.
-                    let err = EngineMsg::Error {
-                        where_: "scene",
-                        message: "scene state updates land in §5.6.a part 2d; rendering hard-coded triangle for now",
-                    };
-                    tx.send(Message::Text(serde_json::to_string(&err)?.into())).await?;
                 }
                 Err(e) => {
                     let err_msg = format!("invalid client message: {}", e);

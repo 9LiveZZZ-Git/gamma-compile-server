@@ -1,74 +1,79 @@
-// gamma-rt-engine -- sprint 7.5.6.a part 2c
+// gamma-rt-engine -- sprint 7.5.6.a part 2e-1
 //
-// Hardware-accelerated ray-triangle test kernel. Same scene as part
-// 2b (one triangle in the XY plane, pinhole camera at z=2), but the
-// per-pixel intersection is now done by Metal's intersector<> running
-// against a real MTLAccelerationStructure. On Apple9+ GPUs (M3, M4)
-// this lowers to the dedicated hardware RT cores; on older Apple
-// silicon (M1, M2) the same source compiles to a software emulation
-// path on the regular shader cores.
+// Editor-driven scene kernel. Inputs:
+//   texture(0) -- output RGBA8
+//   buffer(0)  -- primitive AS (BLAS containing every scene mesh as
+//                 one geometry; geometry_id maps 1:1 to mesh index)
+//   buffer(1)  -- CameraUniform (precomputed pinhole basis + fov)
+//   buffer(2)  -- per-mesh color buffer (float4 per geometry, .xyz)
 //
-// The acceleration structure is built once at MetalRenderer construct
-// time (see metal_path.rs) and bound at buffer(0). The triangle
-// vertices live in a vertex buffer owned by the AS build, so the
-// kernel only needs the AS handle -- no per-vertex MSL constants.
+// Per-pixel: build a ray in world space from the camera basis,
+// intersect against the AS via the hardware RT cores on Apple9+ (M3,
+// M4) or the shader-emulated path on older Apple silicon, then output
+// either the hit mesh's color or the clear-sky color.
 
 #include <metal_stdlib>
 #include <metal_raytracing>
 using namespace metal;
 using namespace metal::raytracing;
 
-kernel void rt_triangle(
-    texture2d<float, access::write> outTex [[texture(0)]],
-    primitive_acceleration_structure accel [[buffer(0)]],
+struct CameraUniform {
+    float4 eye;       // .xyz = world-space eye
+    float4 right;     // .xyz = right basis
+    float4 up;        // .xyz = up basis (orthogonalized)
+    float4 forward;   // .xyz = forward (look) direction
+    float4 misc;      // .x = tan(fov/2), .y = aspect, .zw unused
+};
+
+kernel void rt_scene(
+    texture2d<float, access::write> outTex     [[texture(0)]],
+    primitive_acceleration_structure accel     [[buffer(0)]],
+    constant CameraUniform& camera             [[buffer(1)]],
+    constant float4* colors                    [[buffer(2)]],
     uint2 gid [[thread_position_in_grid]]
 ) {
     const uint w = outTex.get_width();
     const uint h = outTex.get_height();
     if (gid.x >= w || gid.y >= h) return;
 
-    // Screen-space UV in [0, 1].
+    // Pixel UV in [0, 1].
     const float u = (float(gid.x) + 0.5) / float(w);
     const float v = (float(gid.y) + 0.5) / float(h);
 
-    // Pinhole camera. Eye at (0, 0, 2), looking toward -Z.
-    // Image plane at z=1, height 2, width 2*aspect.
-    const float aspect = float(w) / float(h);
-    const float3 ro = float3(0.0, 0.0, 2.0);
-    const float3 rd = normalize(float3(
-        (u - 0.5) * 2.0 * aspect,
-        (0.5 - v) * 2.0,        // flip Y so screen-up = world-up
-        -1.0
-    ));
+    // Screen-space coordinates on the image plane at distance 1.
+    // tan(fov/2) is the half-height; multiply by aspect for half-width.
+    const float screen_x = (2.0 * u - 1.0) * camera.misc.x * camera.misc.y;
+    const float screen_y = (1.0 - 2.0 * v) * camera.misc.x;
+    const float3 rd = normalize(
+        screen_x * camera.right.xyz
+      + screen_y * camera.up.xyz
+      + camera.forward.xyz
+    );
 
-    // Hardware RT path: build a ray, hand it to the intersector,
-    // let the GPU's RT cores (or software emulator on older chips)
-    // traverse the BVH and return the closest hit -- or a miss.
     ray r;
-    r.origin       = ro;
+    r.origin       = camera.eye.xyz;
     r.direction    = rd;
     r.min_distance = 0.001;
     r.max_distance = 1000.0;
 
-    // intersector<triangle_data> means "this AS only has triangles
-    // and I want triangle-specific hit data (barycentrics, primitive
-    // ID)" -- lets the compiler skip the polymorphic dispatch.
+    // intersector<triangle_data> -- this AS holds only triangles and
+    // we want triangle-specific hit data (barycentrics, primitive ID,
+    // geometry ID). assume_geometry_type lets the compiler skip
+    // polymorphic dispatch for a slight perf win.
     intersector<triangle_data> isr;
     isr.assume_geometry_type(geometry_type::triangle);
-
     intersection_result<triangle_data> hit = isr.intersect(r, accel);
 
     float3 color;
     if (hit.type == intersection_type::triangle) {
-        // Barycentric: hit.triangle_barycentric_coord is (u, v) where
-        // the third coord is 1 - u - v. Map (1-u-v, u, v) to RGB so
-        // the three triangle corners get the three primary colors --
-        // matches editor-side DebugTriangle's vertex-color gradient.
-        const float2 bary = hit.triangle_barycentric_coord;
-        const float bw = 1.0 - bary.x - bary.y;
-        color = float3(bw, bary.x, bary.y);
+        // colors[geometry_id] is the per-mesh flat color (option a).
+        // geometry_id is the index of the mesh among the AS's
+        // geometry descriptors, in the order they were appended on
+        // the CPU side -- matches mesh index in the Scene struct.
+        color = colors[hit.geometry_id].xyz;
     } else {
-        color = float3(0.05, 0.06, 0.10);  // dark sky
+        // Sky -- dark navy, same as the raster path's default clear.
+        color = float3(0.05, 0.06, 0.10);
     }
 
     outTex.write(float4(color, 1.0), gid);
