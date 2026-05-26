@@ -95,10 +95,24 @@ python -m pip install --upgrade pip setuptools wheel --quiet
 # Default is ~/.cache/huggingface which can live on a small partition --
 # a 6 GB parallel download via xet has filled tight drives in testing.
 HF_CACHE="$MODELS_DIR/.hf-cache"
-mkdir -p "$HF_CACHE"
+TMP_STAGE="$MODELS_DIR/.tmp"
+mkdir -p "$HF_CACHE" "$TMP_STAGE"
 export HF_HOME="$HF_CACHE"
 export HF_HUB_CACHE="$HF_CACHE"
-say "  HF_HOME = $HF_CACHE (xet cache lives here too)"
+export HF_XET_CACHE_DIR="$HF_CACHE/xet"
+# Also redirect $TMPDIR. The hf_xet Rust downloader uses the OS temp
+# dir for chunk staging, INDEPENDENT of HF_HOME -- on tight system
+# partitions a fat parallel download has been observed to fill it.
+export TMPDIR="$TMP_STAGE"
+# Belt-and-braces: disable the xet downloader entirely. Falls back to
+# the legacy single-stream HTTP path which is slower but predictable
+# and uses Python's tempfile (which honors TMPDIR above). xet has bit
+# Windows installs twice with confusing 'disk full' errors; we keep it
+# off everywhere for consistency. Re-enable by unsetting after install.
+export HF_HUB_DISABLE_XET=1
+say "  HF_HOME = $HF_CACHE"
+say "  TMPDIR  = $TMP_STAGE (xet/tempfile staging)"
+say "  HF_HUB_DISABLE_XET=1 (using legacy downloader)"
 
 # ── 2. Python dependencies ───────────────────────────────────────────
 say "step 2/5  installing Python deps (this can take a few minutes)"

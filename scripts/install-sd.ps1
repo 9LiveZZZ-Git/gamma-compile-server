@@ -98,10 +98,27 @@ if (-not (Test-Path $VenvPython)) { Die "venv python missing at $VenvPython" }
 # Setting HF_HOME redirects the model cache, tokenizer cache, AND
 # xet cache to one place under $ModelsDir.
 $HfCache = Join-Path $ModelsDir ".hf-cache"
+$TmpDir  = Join-Path $ModelsDir ".tmp"
 New-Item -ItemType Directory -Force -Path $HfCache | Out-Null
-$env:HF_HOME      = $HfCache
-$env:HF_HUB_CACHE = $HfCache
-Say "  HF_HOME = $HfCache (xet cache lives here too)"
+New-Item -ItemType Directory -Force -Path $TmpDir  | Out-Null
+$env:HF_HOME           = $HfCache
+$env:HF_HUB_CACHE      = $HfCache
+$env:HF_XET_CACHE_DIR  = Join-Path $HfCache "xet"
+# Also redirect Windows %TEMP%. The hf_xet Rust downloader uses the
+# OS temp dir for chunk staging, INDEPENDENT of HF_HOME -- a fat
+# parallel download has filled C: in testing even with HF_HOME on D:.
+$env:TEMP    = $TmpDir
+$env:TMP     = $TmpDir
+$env:TMPDIR  = $TmpDir
+# Belt-and-braces: disable the xet downloader entirely. Falls back to
+# the legacy single-stream HTTP path which is slower but predictable
+# and uses Python's tempfile (which honors TMPDIR above). xet has bit
+# this install twice with confusing "disk full" errors; default off,
+# user can re-enable by unsetting after the install completes.
+$env:HF_HUB_DISABLE_XET = "1"
+Say "  HF_HOME = $HfCache"
+Say "  TEMP    = $TmpDir (xet/tempfile staging lives here)"
+Say "  HF_HUB_DISABLE_XET=1 (using legacy downloader)"
 
 & $VenvPython -m pip install --upgrade pip setuptools wheel --quiet
 if ($LASTEXITCODE -ne 0) { Die "pip upgrade failed" }
@@ -141,7 +158,7 @@ switch ($Model) {
     $modelCache = Join-Path $ModelsDir "z-image-turbo"
   }
   "flux2-klein" {
-    $modelRepo  = "black-forest-labs/FLUX.2-klein"
+    $modelRepo  = "black-forest-labs/FLUX.2-klein-4B"
     $modelCache = Join-Path $ModelsDir "flux2-klein"
   }
   "sdxl" {

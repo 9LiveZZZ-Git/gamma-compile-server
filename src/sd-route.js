@@ -84,7 +84,32 @@ const state = {
   socket: DEFAULT_SOCKET,
   ready: false,        // worker has finished its preload (sees "listening" log)
   startingPromise: null,
+  // Generation progress, updated by parsing the worker's stdout
+  // [progress] step=N total=M elapsed_ms=... lines and surfaced via
+  // GET /sprite-gen/progress so the editor can drive a progress bar.
+  progress: {
+    busy: false,
+    step: 0,
+    total: 0,
+    elapsedMs: 0,
+    startedAt: 0,
+    lastUpdate: 0,
+  },
 };
+
+function _resetProgress(total) {
+  state.progress.busy = true;
+  state.progress.step = 0;
+  state.progress.total = total | 0;
+  state.progress.elapsedMs = 0;
+  state.progress.startedAt = Date.now();
+  state.progress.lastUpdate = Date.now();
+}
+
+function _finishProgress() {
+  state.progress.busy = false;
+  state.progress.lastUpdate = Date.now();
+}
 
 function pythonBin() {
   // venv path is platform-specific
@@ -136,6 +161,18 @@ function ensureWorker(model) {
     process.stdout.write("[sd-worker] " + text);
     if (text.includes("listening on")) {
       state.ready = true;
+    }
+    // Parse [progress] step=N total=M elapsed_ms=K lines emitted by the
+    // worker's callback_on_step_end. There may be several per chunk so
+    // we walk all matches and take the latest values.
+    const re = /\[progress\]\s+step=(\d+)\s+total=(\d+)\s+elapsed_ms=(\d+)/g;
+    let m, last = null;
+    while ((m = re.exec(text)) !== null) last = m;
+    if (last) {
+      state.progress.step      = parseInt(last[1], 10);
+      state.progress.total     = parseInt(last[2], 10);
+      state.progress.elapsedMs = parseInt(last[3], 10);
+      state.progress.lastUpdate = Date.now();
     }
   });
   proc.stderr.on("data", (chunk) => {
@@ -238,6 +275,11 @@ export function attachSdRoute(app) {
     } catch (e) {
       return res.status(503).json({ error: "worker unavailable: " + e.message });
     }
+    // Clamp dimensions to the model's native resolution. Diffusion
+    // models fail catastrophically below ~256 px (output collapses to
+    // a flat color); the editor's downsample step turns 768→32 cleanly,
+    // so we always generate at native res regardless of what the
+    // browser sent for the final sprite size.
     const native = cfg.defaultNative || 512;
     const reqW = Number(body.width)  || native;
     const reqH = Number(body.height) || native;
@@ -255,9 +297,11 @@ export function attachSdRoute(app) {
       lora_strength: (typeof body.lora_strength === "number")
         ? body.lora_strength : (cfg.defaultLoraStrength || 1.0)
     };
+    _resetProgress(reqObj.steps);
     try {
       const resp = await callWorker(reqObj);
       if (!resp.ok) {
+        _finishProgress();
         return res.status(500).json({ error: resp.error, trace: resp.trace });
       }
       // Return raw PNG so the browser can decode directly without a base64 hop.
@@ -266,10 +310,33 @@ export function attachSdRoute(app) {
       res.set("X-SD-Elapsed-Ms", String(resp.elapsed_ms));
       res.set("X-SD-Model", resp.model || model);
       res.set("X-SD-Device", resp.device || "?");
+      _finishProgress();
       res.send(buf);
     } catch (e) {
+      _finishProgress();
       res.status(500).json({ error: "sprite-gen failed: " + e.message });
     }
+  });
+
+  // Lightweight progress poll for the browser. Returns the latest values
+  // the worker has reported via its callback_on_step_end stdout lines.
+  // The route consumer polls this ~2-3 Hz during a generation; in
+  // between steps the worker is silent so step won't advance, but
+  // browser-side elapsed timers keep moving.
+  app.get("/sprite-gen/progress", (req, res) => {
+    res.json({
+      busy:      state.progress.busy,
+      step:      state.progress.step,
+      total:     state.progress.total,
+      elapsedMs: state.progress.elapsedMs,
+      // Server-clock elapsed since the POST landed -- useful for
+      // pre-step latency (warm-up, LoRA swap) where the worker hasn't
+      // yet fired its first callback.
+      serverElapsedMs: state.progress.startedAt
+        ? (Date.now() - state.progress.startedAt) : 0,
+      model: state.model,
+      ready: state.ready,
+    });
   });
 
   // Graceful shutdown -- kill the worker so the socket file is cleaned up.

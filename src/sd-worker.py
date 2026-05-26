@@ -204,6 +204,24 @@ class Worker:
             generator = torch.Generator(device=self.device).manual_seed(int(seed))
 
         t0 = time.time()
+        # Step-by-step progress callback. Prints a single line to stdout
+        # for each step; sd-route.js parses these and exposes them via
+        # GET /sprite-gen/progress so the browser can drive a progress bar.
+        # Two pipeline APIs in the wild:
+        #   - newer: callback_on_step_end(pipe, step, timestep, kwargs)
+        #   - legacy: callback(step, timestep, latents)
+        # Detect by inspecting the first positional arg.
+        print(f"[progress] step=0 total={steps} elapsed_ms=0", flush=True)
+        def progress_cb(a, b=None, c=None, **kwargs):
+            if hasattr(a, "_internal_dict") or hasattr(a, "scheduler"):
+                step_idx = int(b) if b is not None else 0
+            else:
+                step_idx = int(a) if a is not None else 0
+            elapsed_ms = int((time.time() - t0) * 1000)
+            print(f"[progress] step={step_idx + 1} total={steps} elapsed_ms={elapsed_ms}",
+                  flush=True)
+            return kwargs or {}
+
         pipe_kwargs = dict(
             prompt=prompt,
             width=width,
@@ -215,7 +233,21 @@ class Worker:
         if not self.model_name.startswith("flux"):
             pipe_kwargs["negative_prompt"] = negative
         with torch.inference_mode():
-            out = self.pipe(**pipe_kwargs)
+            # Try newer API first; fall back to legacy if the pipeline
+            # rejects the kwarg. Some custom pipelines don't accept either,
+            # in which case the user just sees no per-step updates (the
+            # bar still shows elapsed-time via the browser timer).
+            try:
+                out = self.pipe(callback_on_step_end=progress_cb, **pipe_kwargs)
+            except TypeError as e1:
+                if "callback_on_step_end" not in str(e1):
+                    raise
+                try:
+                    out = self.pipe(callback=progress_cb, callback_steps=1, **pipe_kwargs)
+                except TypeError as e2:
+                    if "callback" not in str(e2):
+                        raise
+                    out = self.pipe(**pipe_kwargs)
         img = out.images[0]
         elapsed_ms = int((time.time() - t0) * 1000)
 
