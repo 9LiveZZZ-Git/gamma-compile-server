@@ -40,13 +40,23 @@ MODELS_DIR = SCRIPT_DIR.parent / "models"
 LORA_DIR   = MODELS_DIR / "loras"
 
 def _make_z_image(local_dir, device):
-    # Z-Image-Turbo is SD-architecture compatible; loads via the standard
-    # StableDiffusionXL pipeline. Some Z-Image builds use a custom
-    # text encoder -- fall back to the generic AutoPipeline if SDXL fails.
-    from diffusers import AutoPipelineForText2Image
-    pipe = AutoPipelineForText2Image.from_pretrained(
+    # Z-Image-Turbo uses its own pipeline class (added to diffusers main
+    # branch Jan-2026). Requires `pip install git+https://github.com/huggingface/diffusers.git`
+    # for now -- bake into install-sd.sh.
+    # bfloat16 is recommended per the model card; MPS doesn't always
+    # support bf16 cleanly so fall back to float16 there.
+    import torch
+    try:
+        from diffusers import ZImagePipeline
+    except ImportError:
+        # Older diffusers without ZImagePipeline → fall back to AutoPipeline
+        # which may still work via the model's pipeline_class hint.
+        from diffusers import AutoPipelineForText2Image as ZImagePipeline
+    dtype = torch.bfloat16 if device != "mps" else torch.float16
+    pipe = ZImagePipeline.from_pretrained(
         str(local_dir),
-        torch_dtype=_torch_dtype_for(device)
+        torch_dtype=dtype,
+        low_cpu_mem_usage=False
     )
     pipe.to(device)
     pipe.set_progress_bar_config(disable=True)

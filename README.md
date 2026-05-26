@@ -108,38 +108,93 @@ by default; pass `flux2-klein` as the first arg to install-sd.sh).
   venv at `models/sd-venv/`, installs `torch + diffusers + mlx`,
   downloads the model + LoRA from HuggingFace, runs a self-test.
 
-**Setup (macOS / Linux):**
+**Common prerequisites (any OS):**
+
+- Python 3.10+
+- 15 GB free disk (model + venv)
+- An HTTPS connection (~6–12 GB initial download)
+
+### macOS (Apple Silicon recommended)
 
 ```bash
-# from the compile-server checkout
+cd gamma-compile-server
+chmod +x scripts/install-sd.sh
 ./scripts/install-sd.sh                    # default: Z-Image-Turbo
 # or pick a specific model:
 ./scripts/install-sd.sh sdxl               # SDXL + Pixel Art XL LoRA
 ./scripts/install-sd.sh flux2-klein        # Flux.2 klein (no LoRA)
 ```
 
-First install takes 10–30 minutes (mostly the model download — Z-Image
-is ~6 GB, SDXL is ~7 GB, Flux.2 klein is ~12 GB quantized). Disk:
-roughly `model size + 2 GB venv`.
+Apple Silicon (M1/M2/M3/M4) uses the Metal Performance Shaders (MPS)
+backend via PyTorch — auto-detected, no extra setup. Z-Image-Turbo at
+768×768 takes about 30–60 s on M4 Air 32 GB (model-load on first gen
+is the slow part; subsequent gens are fast).
 
-**Status check:**
+If you don't have `python3` on PATH, install via [python.org](https://www.python.org/downloads/macos/) or `brew install python@3.12`.
+
+### Linux
+
+Same as macOS:
 
 ```bash
-curl http://127.0.0.1:8765/sprite-gen/info | jq
+cd gamma-compile-server
+chmod +x scripts/install-sd.sh
+./scripts/install-sd.sh
 ```
 
-Reports which models are installed, which (if any) worker is currently
-loaded, and the socket path.
+NVIDIA + CUDA is auto-detected and dramatically faster than CPU
+(typically <10 s/sprite). On AMD GPUs install ROCm-flavored PyTorch
+into the venv before running the script.
 
-**Per-machine notes:**
+### Windows (PowerShell)
 
-- **Apple Silicon (M1/M2/M3/M4):** uses Metal Performance Shaders via
-  PyTorch MPS backend. Z-Image-Turbo at 768×768 → ~30–60 s on M4 Air
-  with 32 GB. First generation pays the model-load cost; subsequent
-  ones are fast.
-- **Linux + CUDA:** auto-detected, much faster (under 10 s typical).
-- **Windows:** install script doesn't support Windows directly. Use
-  WSL2 + install inside the Linux side.
+Native install via PowerShell (no WSL2 needed):
+
+```powershell
+# Prerequisites (install once):
+#   - Python 3.10+ from python.org (check "Add Python to PATH")
+#   - Git for Windows from git-scm.com
+
+cd gamma-compile-server
+.\scripts\install-sd.ps1                   # default: z-image-turbo
+.\scripts\install-sd.ps1 sdxl              # alternative
+.\scripts\install-sd.ps1 flux2-klein
+```
+
+NVIDIA GPUs are auto-detected and used. AMD / Intel iGPU falls back to
+CPU (SDXL on CPU is impractical → pick z-image-turbo).
+
+If PowerShell blocks the script, run as Administrator and:
+
+```powershell
+Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
+```
+
+### WSL2 fallback (Windows users with AMD/Intel GPU)
+
+If the native Windows path isn't fast enough, run the Linux script
+inside Ubuntu via WSL2:
+
+```bash
+# inside Ubuntu / WSL2:
+cd /mnt/c/Users/<you>/.../gamma-compile-server
+chmod +x scripts/install-sd.sh
+./scripts/install-sd.sh
+```
+
+The Node.js compile-server side stays running on Windows; only the
+Python SD worker lives in WSL. The worker's TCP-socket fallback
+handles the cross-OS bridge.
+
+**Status check (all OSes):**
+
+```bash
+curl http://127.0.0.1:8765/sprite-gen/info
+# or in PowerShell:
+Invoke-RestMethod http://127.0.0.1:8765/sprite-gen/info
+```
+
+Reports installed models, current worker state, socket path.
 
 **Adding a new model (e.g. when the Flux.2 ecosystem matures):**
 

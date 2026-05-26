@@ -91,12 +91,15 @@ say "step 2/5  installing Python deps (this can take a few minutes)"
 PY_PKGS=(
   "torch"
   "torchvision"
-  "diffusers>=0.30"
+  # Z-Image-Turbo's pipeline lives in diffusers main (added Jan 2026 per
+  # the model card). pypi release may lag; pull from git to be safe.
+  "git+https://github.com/huggingface/diffusers.git"
   "transformers"
   "safetensors"
   "accelerate"
   "huggingface_hub[cli]"
   "Pillow"
+  "sentencepiece"
 )
 # MLX is Apple-only and currently optional (Z-Image-Turbo runs fine on
 # diffusers+MPS without it). Skip on Linux.
