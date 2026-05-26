@@ -207,9 +207,9 @@ function ensureWorker(model) {
       } else if (!state.worker) {
         clearInterval(tick);
         reject(new Error("worker exited during startup"));
-      } else if (Date.now() - start > 180000) {  // 3 min
+      } else if (Date.now() - start > 300000) {  // 5 min
         clearInterval(tick);
-        reject(new Error("worker did not become ready within 3 minutes"));
+        reject(new Error("worker did not become ready within 5 minutes"));
       }
     }, 200);
   });
@@ -227,10 +227,15 @@ function callWorker(reqObj) {
       client = net.connect(parseInt(port, 10), host);
     }
     const chunks = [];
+    // 10 minutes per gen. Z-Image-Turbo @ 1024 native on a cold M4
+    // is ~4-5 min for 9 steps; SDXL @ 1024 with 20 steps is ~7-8 min
+    // on the same hardware. 10 min covers both with headroom for the
+    // first-call warm-up where the LoRA also loads.
+    const chunkTimeoutMs = 600000;
     let timeout = setTimeout(() => {
       try { client.destroy(); } catch (_) {}
-      reject(new Error("worker timeout after 180s"));
-    }, 180000);
+      reject(new Error("worker timeout after " + (chunkTimeoutMs / 1000) + "s"));
+    }, chunkTimeoutMs);
     client.on("connect", () => {
       client.write(JSON.stringify(reqObj) + "\n");
     });
