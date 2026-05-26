@@ -46,8 +46,10 @@ def _make_z_image(local_dir, device):
     # Z-Image-Turbo uses its own pipeline class (added to diffusers main
     # branch Jan-2026). Requires `pip install git+https://github.com/huggingface/diffusers.git`
     # for now -- bake into install-sd.sh.
-    # bfloat16 is recommended per the model card; MPS doesn't always
-    # support bf16 cleanly so fall back to float16 there.
+    # bfloat16 across the board: Z-Image was trained in bf16 and its
+    # DiT transformer is fragile in fp16 (attention Q@K^T accumulates
+    # NaN over many steps -> black output). PyTorch 2.5+ supports bf16
+    # on MPS so the old "use fp16 on MPS" workaround is obsolete.
     import torch
     try:
         from diffusers import ZImagePipeline
@@ -55,7 +57,7 @@ def _make_z_image(local_dir, device):
         # Older diffusers without ZImagePipeline → fall back to AutoPipeline
         # which may still work via the model's pipeline_class hint.
         from diffusers import AutoPipelineForText2Image as ZImagePipeline
-    dtype = torch.bfloat16 if device != "mps" else torch.float16
+    dtype = torch.bfloat16
     pipe = ZImagePipeline.from_pretrained(
         str(local_dir),
         torch_dtype=dtype,
@@ -277,6 +279,14 @@ class Worker:
             # rejects the kwarg. Some custom pipelines don't accept either,
             # in which case the user just sees no per-step updates (the
             # bar still shows elapsed-time via the browser timer).
+            # Ask the pipeline for raw numpy output (float [0,1]) so we
+            # can sanitize NaN/Inf BEFORE the (images*255).astype(uint8)
+            # step that triggers the "invalid value encountered in cast"
+            # RuntimeWarning + produces a black square. This is a safety
+            # net on top of the bf16 + VAE upcast fixes -- if either of
+            # those slips, the user still gets a usable (if noisy)
+            # image instead of garbage.
+            pipe_kwargs["output_type"] = "np"
             try:
                 out = self.pipe(callback_on_step_end=progress_cb, **pipe_kwargs)
             except TypeError as e1:
@@ -288,7 +298,18 @@ class Worker:
                     if "callback" not in str(e2):
                         raise
                     out = self.pipe(**pipe_kwargs)
-        img = out.images[0]
+        # out.images is a numpy array of shape (N, H, W, 3) in [0,1].
+        import numpy as np
+        from PIL import Image
+        arr = np.asarray(out.images[0], dtype=np.float32)
+        bad = int(np.sum(~np.isfinite(arr)))
+        if bad > 0:
+            total = int(arr.size)
+            print(f"[sd-worker] WARN: {bad}/{total} non-finite output values "
+                  f"({100.0*bad/total:.1f}%); clamping to mid-gray", flush=True)
+            arr = np.nan_to_num(arr, nan=0.5, posinf=1.0, neginf=0.0)
+        arr = np.clip(arr, 0.0, 1.0)
+        img = Image.fromarray((arr * 255.0).round().astype(np.uint8))
         elapsed_ms = int((time.time() - t0) * 1000)
 
         buf = io.BytesIO()
