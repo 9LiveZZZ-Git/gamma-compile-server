@@ -63,6 +63,7 @@ def _make_z_image(local_dir, device):
     )
     pipe.to(device)
     pipe.set_progress_bar_config(disable=True)
+    _upcast_vae_for_stability(pipe, device)
     return pipe
 
 def _make_sdxl(local_dir, device):
@@ -73,7 +74,36 @@ def _make_sdxl(local_dir, device):
     )
     pipe.to(device)
     pipe.set_progress_bar_config(disable=True)
+    _upcast_vae_for_stability(pipe, device)
     return pipe
+
+def _upcast_vae_for_stability(pipe, device):
+    """Force the VAE decoder to float32 on MPS.
+
+    The MPS backend's float16 ops produce NaN in the VAE decode path
+    on Apple Silicon (most visible at the final image_processor cast:
+    `RuntimeWarning: invalid value encountered in cast` followed by a
+    flat black/uniform output). The transformer/UNet can stay fp16
+    for speed; only the final decode needs fp32, and it's a one-shot
+    pass so the perf hit is small.
+
+    Also try to set force_upcast on the VAE config when available;
+    some pipelines (SDXL especially) honor that flag and upcast just
+    for the decode pass even if the VAE module itself is fp16. On
+    other pipelines that flag is a no-op, so we cast the module too.
+    """
+    import torch
+    if device != "mps":
+        return  # CUDA + CPU don't have the MPS-fp16 VAE NaN issue
+    if not hasattr(pipe, "vae") or pipe.vae is None:
+        return
+    try:
+        pipe.vae = pipe.vae.to(dtype=torch.float32)
+        if hasattr(pipe.vae, "config") and hasattr(pipe.vae.config, "force_upcast"):
+            pipe.vae.config.force_upcast = True
+        print("[sd-worker] VAE upcast to float32 (MPS NaN workaround)", flush=True)
+    except Exception as e:
+        print(f"[sd-worker] VAE upcast failed (will rely on nan_to_num): {e}", flush=True)
 
 def _make_flux2(local_dir, device):
     try:
@@ -89,6 +119,7 @@ def _make_flux2(local_dir, device):
     )
     pipe.to(device)
     pipe.set_progress_bar_config(disable=True)
+    _upcast_vae_for_stability(pipe, device)
     return pipe
 
 MODEL_REGISTRY = {

@@ -53,6 +53,12 @@ const MODELS = {
   "z-image-turbo": {
     label: "Z-Image-Turbo",
     defaultSteps: 9,
+    // Turbo distillation -- model is trained for 4-9 inference
+    // steps; past that the scheduler extrapolates and the output
+    // diverges (NaN / flat color) instead of getting "more detailed".
+    // Server-side clamp protects users who carry over a 20-step
+    // SDXL config when switching models.
+    maxSteps: 9,
     defaultGuidance: 4.0,
     defaultNative: 512,
     defaultLora: null,
@@ -285,12 +291,18 @@ export function attachSdRoute(app) {
     const reqH = Number(body.height) || native;
     const genW = reqW < 256 ? native : reqW;
     const genH = reqH < 256 ? native : reqH;
+    let stepsReq = Number(body.steps) || cfg.defaultSteps || 20;
+    if (cfg.maxSteps && stepsReq > cfg.maxSteps) {
+      console.warn("[sd-route] " + model + ": clamping steps " + stepsReq
+        + " -> " + cfg.maxSteps + " (turbo model diverges past max)");
+      stepsReq = cfg.maxSteps;
+    }
     const reqObj = {
       prompt:   body.prompt,
       negative: body.negative || "blurry, smooth, anti-aliased, low quality, watermark, jpeg artifacts",
       width:    genW,
       height:   genH,
-      steps:    Number(body.steps)  || cfg.defaultSteps  || 20,
+      steps:    stepsReq,
       guidance: Number(body.guidance) || cfg.defaultGuidance || 7.0,
       seed:     (typeof body.seed === "number") ? body.seed : null,
       lora:     (body.lora === undefined) ? cfg.defaultLora : body.lora,
