@@ -25,7 +25,15 @@ set -euo pipefail
 # ── Paths ────────────────────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SERVER_DIR="$(dirname "$SCRIPT_DIR")"
-MODELS_DIR="$SERVER_DIR/models"
+# Honor $GAMMA_MODELS_DIR for installs OUTSIDE the server checkout (e.g.
+# server lives in iCloud/OneDrive but model weights need a separate
+# drive or non-synced location). Default: <server>/models.
+if [[ -n "${GAMMA_MODELS_DIR:-}" ]]; then
+  MODELS_DIR="$GAMMA_MODELS_DIR"
+  echo "[install-sd] using GAMMA_MODELS_DIR=$MODELS_DIR"
+else
+  MODELS_DIR="$SERVER_DIR/models"
+fi
 VENV_DIR="$MODELS_DIR/sd-venv"
 LORA_DIR="$MODELS_DIR/loras"
 

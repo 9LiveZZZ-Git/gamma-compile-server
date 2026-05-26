@@ -24,9 +24,16 @@ import os from "node:os";
 
 const __dirname  = dirname(fileURLToPath(import.meta.url));
 const SERVER_DIR = join(__dirname, "..");
-const MODELS_DIR = join(SERVER_DIR, "models");
+// Honor GAMMA_MODELS_DIR so model weights can live off the server
+// checkout (e.g. server in OneDrive, models on a different drive).
+const MODELS_DIR = process.env.GAMMA_MODELS_DIR
+  ? process.env.GAMMA_MODELS_DIR
+  : join(SERVER_DIR, "models");
 const VENV_DIR   = join(MODELS_DIR, "sd-venv");
 const WORKER_PY  = join(__dirname, "sd-worker.py");
+if (process.env.GAMMA_MODELS_DIR) {
+  console.log("[sd-route] GAMMA_MODELS_DIR=" + MODELS_DIR);
+}
 
 // Per-OS socket path. Unix socket on Mac/Linux (~1µs RTT); TCP on
 // Windows (Node's Unix-socket support there is iffy, plus most Win SD

@@ -36,7 +36,10 @@ from pathlib import Path
 # Maps the --model arg to (HF-style local_dir, pipeline factory). Add new
 # entries here when expanding to Flux.2 etc.
 SCRIPT_DIR = Path(__file__).resolve().parent
-MODELS_DIR = SCRIPT_DIR.parent / "models"
+# Honor GAMMA_MODELS_DIR so model weights can live off the server
+# checkout (matches install-sd.sh / install-sd.ps1 / sd-route.js).
+_env_models = os.environ.get("GAMMA_MODELS_DIR")
+MODELS_DIR = Path(_env_models) if _env_models else (SCRIPT_DIR.parent / "models")
 LORA_DIR   = MODELS_DIR / "loras"
 
 def _make_z_image(local_dir, device):

@@ -114,6 +114,25 @@ by default; pass `flux2-klein` as the first arg to install-sd.sh).
 - 15 GB free disk (model + venv)
 - An HTTPS connection (~6–12 GB initial download)
 
+**`GAMMA_MODELS_DIR` env var (recommended):** point the install scripts +
+server at a custom directory for the model cache. Useful when the
+compile-server checkout lives in iCloud / OneDrive / Dropbox (you
+don't want 6+ GB of model weights syncing) or on a small system drive
+(point at a roomier secondary drive). Honored by `install-sd.sh`,
+`install-sd.ps1`, `src/sd-route.js`, and `src/sd-worker.py`:
+
+```bash
+# Linux / macOS
+export GAMMA_MODELS_DIR=/Volumes/Workdrive/gamma-models
+./scripts/install-sd.sh
+npm start                                 # server reads same env var
+
+# Windows PowerShell
+$env:GAMMA_MODELS_DIR = "D:\gamma-models"
+.\scripts\install-sd.ps1
+npm start
+```
+
 ### macOS (Apple Silicon recommended)
 
 ```bash
