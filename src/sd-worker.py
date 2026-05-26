@@ -157,12 +157,24 @@ class Worker:
             print(f"[sd-worker] LoRA not found: {lora_path} (skipping)", flush=True)
             self.current_lora = None
             return
-        self.pipe.load_lora_weights(str(lora_path))
+        # Wrap both the load AND fuse in try/except so an install missing
+        # the `peft` package (required by diffusers since v0.27 for LoRA
+        # ops) still produces a sprite -- just without the LoRA. The
+        # user sees a one-line warning instead of a 500.
+        try:
+            self.pipe.load_lora_weights(str(lora_path))
+        except Exception as e:
+            print(f"[sd-worker] LoRA load failed for {lora_name}: {e}", flush=True)
+            print(f"[sd-worker]   tip: run `pip install peft` inside the sd-venv", flush=True)
+            self.current_lora = None
+            return
         try:
             # Newer diffusers: set adapter strength via fuse_lora.
             self.pipe.fuse_lora(lora_scale=strength)
-        except Exception:
-            pass
+        except Exception as e:
+            # fuse_lora is optional; the LoRA may still apply via the
+            # default adapter weight even if fuse fails.
+            print(f"[sd-worker] fuse_lora warning (LoRA still bound): {e}", flush=True)
         self.current_lora = lora_name
         self.current_lora_strength = strength
         print(f"[sd-worker] LoRA loaded: {lora_name} @ {strength:.2f}", flush=True)

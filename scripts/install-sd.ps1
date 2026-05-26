@@ -104,6 +104,10 @@ $pyPkgs = @(
   "transformers",
   "safetensors",
   "accelerate",
+  # peft is required by diffusers' load_lora_weights() / fuse_lora()
+  # since ~v0.27. Without it, applying the Pixel Art LoRA throws
+  # 'PEFT backend is required for this method' at generation time.
+  "peft",
   "huggingface_hub[cli]",
   "Pillow",
   "sentencepiece"
