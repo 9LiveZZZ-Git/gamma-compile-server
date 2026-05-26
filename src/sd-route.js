@@ -104,13 +104,13 @@ const MODELS = {
     // SDXL config when switching models.
     maxSteps: 9,
     defaultGuidance: 4.0,
-    // 1024 is the model's actual training resolution. We were running
-    // at 512 to cut M4 gen time in half, but the output looked muddy
-    // and the subject filled only a tiny fraction of the post-downsample
-    // sprite. 1024 takes ~4× longer per step but the quality jump is
-    // dramatic -- pixel-art sprites need the LoRA + prompt to operate
-    // at native res to land cleanly after nearest-neighbor downsample.
-    defaultNative: 1024,
+    // 512 = "Standard" quality, matched to the editor's QUALITY
+    // dropdown default. 1024 looks better but takes ~4-5 min per
+    // frame on M4 and routinely timed out in real usage; 512 lands
+    // in ~1 min and downsamples cleanly. Users who want the
+    // dramatic detail bump can pick "High" or "Max" in the modal,
+    // which sends the higher width/height explicitly.
+    defaultNative: 512,
     defaultLora: null,
     defaultLoraStrength: 1.0
   },
