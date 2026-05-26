@@ -54,7 +54,7 @@ const MODELS = {
     label: "Z-Image-Turbo",
     defaultSteps: 9,
     defaultGuidance: 4.0,
-    defaultNative: 768,
+    defaultNative: 512,
     defaultLora: null,
     defaultLoraStrength: 1.0
   },
