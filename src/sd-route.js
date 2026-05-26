@@ -16,7 +16,7 @@
 //   - Switching models = killing current worker + spawning a new one
 
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, unlinkSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import net from "node:net";
@@ -48,6 +48,50 @@ if (process.env.GAMMA_MODELS_DIR) {
 // installs use WSL2 anyway).
 const IS_WIN = process.platform === "win32";
 const DEFAULT_SOCKET = IS_WIN ? "tcp:127.0.0.1:8766" : "/tmp/gamma-sd-worker.sock";
+
+/* Stale-worker cleanup. The worker writes its PID to a sibling file
+ * on startup; we check for it at module load, kill any process the
+ * PID points at, and remove both the PID file and (Unix) socket file
+ * so the new spawn doesn't try to bind an already-held address.
+ *
+ * Without this, restarting `npm start` while a previous worker is
+ * still running leaves an orphan that the new server can't connect
+ * to: the new spawn fails ("address already in use" on Windows TCP,
+ * or "socket file exists" on Unix), and the user sees mysterious
+ * 503 / timeout errors that only go away after a manual `pkill`. */
+function _stalePidPath() {
+  if (IS_WIN) {
+    return join(os.tmpdir(), "gamma-sd-worker.pid");
+  }
+  return DEFAULT_SOCKET + ".pid";
+}
+function _killStaleWorker() {
+  const pidFile = _stalePidPath();
+  if (existsSync(pidFile)) {
+    try {
+      const pid = parseInt(readFileSync(pidFile, "utf-8").trim(), 10);
+      if (Number.isFinite(pid) && pid > 0) {
+        try {
+          process.kill(pid, "SIGTERM");
+          console.log("[sd-route] sent SIGTERM to stale worker pid=" + pid);
+        } catch (e) {
+          // ESRCH = no such process (already gone) -- fine.
+          if (e && e.code !== "ESRCH") {
+            console.warn("[sd-route] could not kill pid " + pid + ": " + e.message);
+          }
+        }
+      }
+    } catch (e) {
+      console.warn("[sd-route] reading stale pid file failed: " + e.message);
+    }
+    try { unlinkSync(pidFile); } catch (_) {}
+  }
+  // Unix socket file (TCP doesn't have a file to clean).
+  if (!IS_WIN) {
+    try { unlinkSync(DEFAULT_SOCKET); } catch (_) {}
+  }
+}
+_killStaleWorker();
 
 const MODELS = {
   "z-image-turbo": {
@@ -207,9 +251,9 @@ function ensureWorker(model) {
       } else if (!state.worker) {
         clearInterval(tick);
         reject(new Error("worker exited during startup"));
-      } else if (Date.now() - start > 300000) {  // 5 min
+      } else if (Date.now() - start > 600000) {  // 10 min
         clearInterval(tick);
-        reject(new Error("worker did not become ready within 5 minutes"));
+        reject(new Error("worker did not become ready within 10 minutes"));
       }
     }, 200);
   });
@@ -227,11 +271,13 @@ function callWorker(reqObj) {
       client = net.connect(parseInt(port, 10), host);
     }
     const chunks = [];
-    // 10 minutes per gen. Z-Image-Turbo @ 1024 native on a cold M4
-    // is ~4-5 min for 9 steps; SDXL @ 1024 with 20 steps is ~7-8 min
-    // on the same hardware. 10 min covers both with headroom for the
-    // first-call warm-up where the LoRA also loads.
-    const chunkTimeoutMs = 600000;
+    // 20 minutes per gen. Z-Image-Turbo @ 1024 native on a cold M4 is
+    // ~4-5 min for 9 steps; SDXL @ 1024 with 20 steps is ~7-8 min.
+    // First call also pays LoRA load (~10s) + cold MPS warmup (variable).
+    // Slower hardware (M1/M2, CPU fallback) routinely exceeds 10 min,
+    // so the limit is now 20 min. Subsequent calls are far quicker;
+    // this is a safety net, not a typical-case budget.
+    const chunkTimeoutMs = 1200000;
     let timeout = setTimeout(() => {
       try { client.destroy(); } catch (_) {}
       reject(new Error("worker timeout after " + (chunkTimeoutMs / 1000) + "s"));

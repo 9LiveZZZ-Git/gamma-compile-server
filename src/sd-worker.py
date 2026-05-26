@@ -22,6 +22,7 @@ Adding a model later (e.g. flux2-klein):
   - no worker code changes needed
 """
 import argparse
+import atexit
 import base64
 import io
 import json
@@ -31,6 +32,17 @@ import sys
 import time
 import traceback
 from pathlib import Path
+
+def _pid_file_for(socket_path):
+    """Where the worker writes its PID. Adjacent to the socket so
+    sd-route.js can find it via the same path convention. On Windows
+    (TCP) the socket_path isn't a file, so we use a fixed temp path."""
+    if socket_path.startswith("tcp:"):
+        return os.path.join(
+            os.environ.get("TEMP") or os.environ.get("TMPDIR") or "/tmp",
+            "gamma-sd-worker.pid"
+        )
+    return socket_path + ".pid"
 
 # ── Model registry ───────────────────────────────────────────────────
 # Maps the --model arg to (HF-style local_dir, pipeline factory). Add new
@@ -343,9 +355,28 @@ def serve(socket_path, model_name):
     else:
         host, port = socket_path[len("tcp:"):].split(":")
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        # SO_REUSEADDR so a fresh server can bind even if the kernel
+        # still has the old socket in TIME_WAIT after an abrupt exit.
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         srv.bind((host, int(port)))
     srv.listen(4)
-    print(f"[sd-worker] listening on {socket_path}", flush=True)
+    # PID file lets sd-route.js kill any stale worker on its own
+    # restart. We register atexit cleanup so the file goes away on a
+    # clean exit; the new server will overwrite it on dirty exit.
+    pid_file = _pid_file_for(socket_path)
+    try:
+        with open(pid_file, "w") as f:
+            f.write(str(os.getpid()))
+        def _cleanup_pid():
+            try: os.remove(pid_file)
+            except Exception: pass
+            if is_unix:
+                try: os.remove(socket_path)
+                except Exception: pass
+        atexit.register(_cleanup_pid)
+    except Exception as e:
+        print(f"[sd-worker] WARN pid-file write failed: {e}", flush=True)
+    print(f"[sd-worker] listening on {socket_path} (pid={os.getpid()})", flush=True)
 
     while True:
         conn, _ = srv.accept()
