@@ -81,6 +81,76 @@ tablet on the same network:
 Replace `192.168.1.42` with your host's actual LAN IP. The daemon's
 startup banner shows when it's bound to all interfaces.
 
+## Sprite generation (optional)
+
+The `/sprite-gen` POST route runs a local Stable Diffusion model and
+returns a PNG, used by the editor's **SpriteCreator** node (Sprite
+Studio modal → backend = `Compile-server SD`). Bundled, open-source,
+no third-party API keys.
+
+**Default model:** [Z-Image-Turbo](https://huggingface.co/Tongyi-MAI/Z-Image-Turbo)
+(Apache 2.0) + the
+[Pixel Art XL LoRA](https://huggingface.co/nerijs/pixel-art-xl) for
+sprite-friendly output. Other models slot in via `MODEL_REGISTRY` in
+`src/sd-worker.py` — currently supports `z-image-turbo`, `sdxl`, and
+`flux2-klein` (Flux is wired but the install script doesn't pull it
+by default; pass `flux2-klein` as the first arg to install-sd.sh).
+
+**Architecture:**
+
+- `src/sd-worker.py` is a long-lived Python process that loads the model
+  ONCE (~30–60s on Apple Silicon) then serves generation requests over
+  a Unix socket (TCP on Windows). Subsequent generations skip the
+  model-load cost.
+- `src/sd-route.js` is the Express route. Spawns the worker on the
+  first `/sprite-gen` request, keeps it warm. Returns raw PNG bytes.
+- `scripts/install-sd.sh` is the one-shot installer: creates a Python
+  venv at `models/sd-venv/`, installs `torch + diffusers + mlx`,
+  downloads the model + LoRA from HuggingFace, runs a self-test.
+
+**Setup (macOS / Linux):**
+
+```bash
+# from the compile-server checkout
+./scripts/install-sd.sh                    # default: Z-Image-Turbo
+# or pick a specific model:
+./scripts/install-sd.sh sdxl               # SDXL + Pixel Art XL LoRA
+./scripts/install-sd.sh flux2-klein        # Flux.2 klein (no LoRA)
+```
+
+First install takes 10–30 minutes (mostly the model download — Z-Image
+is ~6 GB, SDXL is ~7 GB, Flux.2 klein is ~12 GB quantized). Disk:
+roughly `model size + 2 GB venv`.
+
+**Status check:**
+
+```bash
+curl http://127.0.0.1:8765/sprite-gen/info | jq
+```
+
+Reports which models are installed, which (if any) worker is currently
+loaded, and the socket path.
+
+**Per-machine notes:**
+
+- **Apple Silicon (M1/M2/M3/M4):** uses Metal Performance Shaders via
+  PyTorch MPS backend. Z-Image-Turbo at 768×768 → ~30–60 s on M4 Air
+  with 32 GB. First generation pays the model-load cost; subsequent
+  ones are fast.
+- **Linux + CUDA:** auto-detected, much faster (under 10 s typical).
+- **Windows:** install script doesn't support Windows directly. Use
+  WSL2 + install inside the Linux side.
+
+**Adding a new model (e.g. when the Flux.2 ecosystem matures):**
+
+1. Add an entry to `MODEL_REGISTRY` in `src/sd-worker.py` with the
+   local cache dir + a pipeline-factory function.
+2. Add a matching entry to `MODELS` in `src/sd-route.js` with
+   sampling defaults (steps, guidance, native size, LoRA name).
+3. Add a `pull_model()` case in `scripts/install-sd.sh` with the
+   HuggingFace repo name.
+4. Run `./scripts/install-sd.sh <new-model-name>` to download weights.
+
 ## Hardware ray tracing (optional)
 
 The `rt-engine/` sibling directory ships a separate Rust binary —

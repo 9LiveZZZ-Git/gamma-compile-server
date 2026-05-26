@@ -13,6 +13,7 @@ import { compile } from "./compile.js";
 import { startOscBridge } from "./osc-bridge.js";
 import { probeEngine, spawnEngine, isPortInUse } from "./rt-engine-host.js";
 import { attachRtProxy } from "./rt-proxy.js";
+import { attachSdRoute } from "./sd-route.js";
 
 // Read package version once at startup so /health reports the actual
 // running version. Better than hardcoding a string that drifts on bumps.
@@ -80,6 +81,13 @@ export async function startServer({
   }));
 
   app.use(express.json({ limit: "2mb" }));
+
+  // SpriteCreator-2 -- /sprite-gen route. Spawns a persistent Python
+  // worker on first request, talks to it via a Unix socket (TCP on
+  // Windows). Worker loads the SD model once and stays warm. No-op
+  // unless scripts/install-sd.sh has been run (the route returns 503
+  // with install instructions if Python venv or model is missing).
+  attachSdRoute(app);
 
   // Sprint 7.5.6.a part 1 -- probe the rt-engine binary at server
   // start. The result is reported back via /health so the editor
