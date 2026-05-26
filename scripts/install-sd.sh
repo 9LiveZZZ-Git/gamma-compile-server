@@ -149,9 +149,8 @@ pull_model() {
     ok "model already downloaded -- skipping (delete $MODEL_CACHE/.installed to force)"
     return 0
   fi
-  if ! huggingface-cli download "$MODEL_REPO" \
-        --local-dir "$MODEL_CACHE" \
-        --local-dir-use-symlinks False; then
+  if ! hf download "$MODEL_REPO" \
+        --local-dir "$MODEL_CACHE"; then
     warn "HF download failed. Common causes:"
     warn "  - need to accept the model license: visit https://huggingface.co/$MODEL_REPO"
     warn "  - need to run 'huggingface-cli login' if the model is gated"
@@ -165,14 +164,13 @@ pull_model "$MODEL_NAME"
 # ── 4. Pixel Art LoRA ────────────────────────────────────────────────
 say "step 4/5  downloading Pixel Art LoRA"
 LORA_REPO="nerijs/pixel-art-xl"          # SDXL-trained; works with Z-Image base too in practice.
-LORA_FILE="pixel-art-xl-v1.1.safetensors"
+LORA_FILE="pixel-art-xl.safetensors"
 LORA_PATH="$LORA_DIR/$LORA_FILE"
 if [[ -f "$LORA_PATH" ]]; then
   ok "LoRA already present -- skipping"
 else
-  huggingface-cli download "$LORA_REPO" "$LORA_FILE" \
+  hf download "$LORA_REPO" "$LORA_FILE" \
       --local-dir "$LORA_DIR" \
-      --local-dir-use-symlinks False \
     || die "LoRA download failed"
   ok "downloaded to $LORA_PATH"
 fi

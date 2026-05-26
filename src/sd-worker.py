@@ -272,7 +272,7 @@ def self_test(model_name, out_path):
         "negative": "blurry, photo",
         "width": 256, "height": 256,
         "steps": 6, "guidance": 4.0, "seed": 1234,
-        "lora": "pixel-art-xl-v1.1.safetensors", "lora_strength": 1.0
+        "lora": "pixel-art-xl.safetensors", "lora_strength": 1.0
     }
     print(f"[sd-worker] self-test: {req['prompt']}", flush=True)
     resp = worker.generate(req)

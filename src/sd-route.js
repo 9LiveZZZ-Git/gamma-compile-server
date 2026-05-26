@@ -47,7 +47,7 @@ const MODELS = {
     defaultSteps: 9,
     defaultGuidance: 4.0,
     defaultNative: 768,
-    defaultLora: "pixel-art-xl-v1.1.safetensors",
+    defaultLora: "pixel-art-xl.safetensors",
     defaultLoraStrength: 1.0
   },
   "sdxl": {
@@ -55,7 +55,7 @@ const MODELS = {
     defaultSteps: 20,
     defaultGuidance: 7.0,
     defaultNative: 1024,
-    defaultLora: "pixel-art-xl-v1.1.safetensors",
+    defaultLora: "pixel-art-xl.safetensors",
     defaultLoraStrength: 1.2
   },
   "flux2-klein": {
