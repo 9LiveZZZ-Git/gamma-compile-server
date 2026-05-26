@@ -76,12 +76,16 @@ def _make_sdxl(local_dir, device):
     return pipe
 
 def _make_flux2(local_dir, device):
-    # Flux uses its own pipeline class; this branch is wired so installing
-    # Flux.2 later is a one-line registry add, not a worker rewrite.
-    from diffusers import FluxPipeline
-    pipe = FluxPipeline.from_pretrained(
+    try:
+        from diffusers import Flux2KleinPipeline
+    except ImportError:
+        from diffusers import AutoPipelineForText2Image as Flux2KleinPipeline
+    import torch
+    dtype = torch.bfloat16 if device != "mps" else torch.float16
+    pipe = Flux2KleinPipeline.from_pretrained(
         str(local_dir),
-        torch_dtype=_torch_dtype_for(device)
+        torch_dtype=dtype,
+        low_cpu_mem_usage=False
     )
     pipe.to(device)
     pipe.set_progress_bar_config(disable=True)
@@ -200,16 +204,18 @@ class Worker:
             generator = torch.Generator(device=self.device).manual_seed(int(seed))
 
         t0 = time.time()
+        pipe_kwargs = dict(
+            prompt=prompt,
+            width=width,
+            height=height,
+            num_inference_steps=steps,
+            guidance_scale=guidance,
+            generator=generator,
+        )
+        if not self.model_name.startswith("flux"):
+            pipe_kwargs["negative_prompt"] = negative
         with torch.inference_mode():
-            out = self.pipe(
-                prompt=prompt,
-                negative_prompt=negative,
-                width=width,
-                height=height,
-                num_inference_steps=steps,
-                guidance_scale=guidance,
-                generator=generator,
-            )
+            out = self.pipe(**pipe_kwargs)
         img = out.images[0]
         elapsed_ms = int((time.time() - t0) * 1000)
 
@@ -279,12 +285,14 @@ def serve(socket_path, model_name):
 def self_test(model_name, out_path):
     worker = Worker(model_name)
     worker.load()
+    use_lora = not model_name.startswith("flux")
     req = {
         "prompt": "pixel art, small red fox, simple, side view",
         "negative": "blurry, photo",
         "width": 256, "height": 256,
         "steps": 6, "guidance": 4.0, "seed": 1234,
-        "lora": "pixel-art-xl.safetensors", "lora_strength": 1.0
+        "lora": "pixel-art-xl.safetensors" if use_lora else None,
+        "lora_strength": 1.0
     }
     print(f"[sd-worker] self-test: {req['prompt']}", flush=True)
     resp = worker.generate(req)

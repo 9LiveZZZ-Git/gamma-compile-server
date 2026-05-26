@@ -134,7 +134,7 @@ pull_model() {
       MODEL_CACHE="$MODELS_DIR/z-image-turbo"
       ;;
     flux2-klein)
-      MODEL_REPO="black-forest-labs/FLUX.2-klein"
+      MODEL_REPO="black-forest-labs/FLUX.2-klein-4B"
       MODEL_CACHE="$MODELS_DIR/flux2-klein"
       ;;
     sdxl)
