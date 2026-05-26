@@ -55,7 +55,7 @@ const MODELS = {
     defaultSteps: 9,
     defaultGuidance: 4.0,
     defaultNative: 768,
-    defaultLora: "pixel-art-xl.safetensors",
+    defaultLora: null,
     defaultLoraStrength: 1.0
   },
   "sdxl": {
@@ -238,11 +238,16 @@ export function attachSdRoute(app) {
     } catch (e) {
       return res.status(503).json({ error: "worker unavailable: " + e.message });
     }
+    const native = cfg.defaultNative || 512;
+    const reqW = Number(body.width)  || native;
+    const reqH = Number(body.height) || native;
+    const genW = reqW < 256 ? native : reqW;
+    const genH = reqH < 256 ? native : reqH;
     const reqObj = {
       prompt:   body.prompt,
       negative: body.negative || "blurry, smooth, anti-aliased, low quality, watermark, jpeg artifacts",
-      width:    Number(body.width)  || cfg.defaultNative || 512,
-      height:   Number(body.height) || cfg.defaultNative || 512,
+      width:    genW,
+      height:   genH,
       steps:    Number(body.steps)  || cfg.defaultSteps  || 20,
       guidance: Number(body.guidance) || cfg.defaultGuidance || 7.0,
       seed:     (typeof body.seed === "number") ? body.seed : null,
