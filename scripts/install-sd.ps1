@@ -91,6 +91,18 @@ $VenvPip    = Join-Path $VenvDir "Scripts\pip.exe"
 $VenvHf     = Join-Path $VenvDir "Scripts\hf.exe"
 if (-not (Test-Path $VenvPython)) { Die "venv python missing at $VenvPython" }
 
+# Pin HF_HOME to a dir on the SAME drive as the model so the xet
+# chunk-download cache doesn't blow up the user's C: drive. Default
+# is ~/.cache/huggingface which on Windows lives on C: -- a 6 GB
+# parallel download via xet has filled tight C: drives in testing.
+# Setting HF_HOME redirects the model cache, tokenizer cache, AND
+# xet cache to one place under $ModelsDir.
+$HfCache = Join-Path $ModelsDir ".hf-cache"
+New-Item -ItemType Directory -Force -Path $HfCache | Out-Null
+$env:HF_HOME      = $HfCache
+$env:HF_HUB_CACHE = $HfCache
+Say "  HF_HOME = $HfCache (xet cache lives here too)"
+
 & $VenvPython -m pip install --upgrade pip setuptools wheel --quiet
 if ($LASTEXITCODE -ne 0) { Die "pip upgrade failed" }
 

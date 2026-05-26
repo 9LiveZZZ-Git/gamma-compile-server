@@ -90,6 +90,16 @@ fi
 source "$VENV_DIR/bin/activate"
 python -m pip install --upgrade pip setuptools wheel --quiet
 
+# Pin HF_HOME to a dir on the SAME drive as the model so the xet
+# chunk-download cache doesn't blow up the user's home / system drive.
+# Default is ~/.cache/huggingface which can live on a small partition --
+# a 6 GB parallel download via xet has filled tight drives in testing.
+HF_CACHE="$MODELS_DIR/.hf-cache"
+mkdir -p "$HF_CACHE"
+export HF_HOME="$HF_CACHE"
+export HF_HUB_CACHE="$HF_CACHE"
+say "  HF_HOME = $HF_CACHE (xet cache lives here too)"
+
 # ── 2. Python dependencies ───────────────────────────────────────────
 say "step 2/5  installing Python deps (this can take a few minutes)"
 # Apple Silicon path: torch with MPS support is the default wheel.
