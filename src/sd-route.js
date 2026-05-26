@@ -33,6 +33,14 @@ const VENV_DIR   = join(MODELS_DIR, "sd-venv");
 const WORKER_PY  = join(__dirname, "sd-worker.py");
 if (process.env.GAMMA_MODELS_DIR) {
   console.log("[sd-route] GAMMA_MODELS_DIR=" + MODELS_DIR);
+} else if (!existsSync(MODELS_DIR)) {
+  // Warn at startup -- without the env var, /sprite-gen will 503 with
+  // "venv missing" on the first request. Better to nag now.
+  console.warn("[sd-route] no models dir at " + MODELS_DIR + " and GAMMA_MODELS_DIR unset.");
+  console.warn("[sd-route]   if you installed elsewhere, set the env var before npm start:");
+  console.warn("[sd-route]     export GAMMA_MODELS_DIR=/path/to/gamma-models    (mac/linux)");
+  console.warn("[sd-route]     $env:GAMMA_MODELS_DIR = 'D:\\gamma-models'        (windows ps)");
+  console.warn("[sd-route]   /sprite-gen will return 503 until the venv + model are found.");
 }
 
 // Per-OS socket path. Unix socket on Mac/Linux (~1µs RTT); TCP on
