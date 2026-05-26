@@ -212,11 +212,20 @@ class Worker:
         #   - legacy: callback(step, timestep, latents)
         # Detect by inspecting the first positional arg.
         print(f"[progress] step=0 total={steps} elapsed_ms=0", flush=True)
-        def progress_cb(a, b=None, c=None, **kwargs):
-            if hasattr(a, "_internal_dict") or hasattr(a, "scheduler"):
-                step_idx = int(b) if b is not None else 0
+        # *args because the two diffusers callback APIs differ in arity:
+        #   - newer: (pipe, step_index, timestep, callback_kwargs)  -> 4 positional
+        #   - legacy: (step_index, timestep, latents)                -> 3 positional
+        # The step index is args[1] in the newer API (after pipe) or
+        # args[0] in the legacy one. Detect by length, not by attribute
+        # probing -- the 4-arg case may pass `pipe=None` in some edge
+        # paths (custom pipelines) so hasattr() isn't reliable.
+        def progress_cb(*args, **kwargs):
+            if len(args) >= 4:
+                step_idx = int(args[1]) if args[1] is not None else 0
+            elif len(args) >= 1:
+                step_idx = int(args[0]) if args[0] is not None else 0
             else:
-                step_idx = int(a) if a is not None else 0
+                step_idx = 0
             elapsed_ms = int((time.time() - t0) * 1000)
             print(f"[progress] step={step_idx + 1} total={steps} elapsed_ms={elapsed_ms}",
                   flush=True)
