@@ -85,7 +85,10 @@ if (Test-Path $VenvDir) {
 
 $VenvPython = Join-Path $VenvDir "Scripts\python.exe"
 $VenvPip    = Join-Path $VenvDir "Scripts\pip.exe"
-$VenvHf     = Join-Path $VenvDir "Scripts\huggingface-cli.exe"
+# huggingface_hub 1.x renamed the CLI to `hf` (the old `huggingface-cli`
+# is still installed but emits a deprecation warning + ditches some
+# flags like --local-dir-use-symlinks). Use `hf` everywhere.
+$VenvHf     = Join-Path $VenvDir "Scripts\hf.exe"
 if (-not (Test-Path $VenvPython)) { Die "venv python missing at $VenvPython" }
 
 & $VenvPython -m pip install --upgrade pip setuptools wheel --quiet
@@ -108,7 +111,9 @@ $pyPkgs = @(
   # since ~v0.27. Without it, applying the Pixel Art LoRA throws
   # 'PEFT backend is required for this method' at generation time.
   "peft",
-  "huggingface_hub[cli]",
+  # huggingface_hub 1.x bundles the `hf` CLI by default; the [cli]
+  # extra is gone and warns 'does not provide the extra cli'.
+  "huggingface_hub",
   "Pillow",
   "sentencepiece"
 )
@@ -140,11 +145,11 @@ $installedMarker = Join-Path $modelCache ".installed"
 if (Test-Path $installedMarker) {
   Ok "model already downloaded -- skipping (delete $installedMarker to force)"
 } else {
-  & $VenvHf download $modelRepo --local-dir $modelCache --local-dir-use-symlinks False
+  & $VenvHf download $modelRepo --local-dir $modelCache
   if ($LASTEXITCODE -ne 0) {
     Warn "HF download failed. Common causes:"
     Warn "  - need to accept the model license: visit https://huggingface.co/$modelRepo"
-    Warn "  - need to run 'huggingface-cli login' if the model is gated"
+    Warn "  - need to run 'hf auth login' if the model is gated"
     Die "model download failed"
   }
   New-Item -ItemType File -Path $installedMarker | Out-Null
@@ -154,12 +159,12 @@ if (Test-Path $installedMarker) {
 # ---------- 4. Pixel Art LoRA ----------
 Say "step 4/5  downloading Pixel Art LoRA"
 $loraRepo = "nerijs/pixel-art-xl"
-$loraFile = "pixel-art-xl-v1.1.safetensors"
+$loraFile = "pixel-art-xl.safetensors"
 $loraPath = Join-Path $LoraDir $loraFile
 if (Test-Path $loraPath) {
   Ok "LoRA already present -- skipping"
 } else {
-  & $VenvHf download $loraRepo $loraFile --local-dir $LoraDir --local-dir-use-symlinks False
+  & $VenvHf download $loraRepo $loraFile --local-dir $LoraDir
   if ($LASTEXITCODE -ne 0) { Die "LoRA download failed" }
   Ok "downloaded to $loraPath"
 }

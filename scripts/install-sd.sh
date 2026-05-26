@@ -109,7 +109,9 @@ PY_PKGS=(
   # since ~v0.27. Without it, applying the Pixel Art LoRA throws
   # 'PEFT backend is required for this method' at generation time.
   "peft"
-  "huggingface_hub[cli]"
+  # huggingface_hub 1.x bundles the `hf` CLI by default; the [cli]
+  # extra is gone and warns 'does not provide the extra cli'.
+  "huggingface_hub"
   "Pillow"
   "sentencepiece"
 )
