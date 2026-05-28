@@ -58,9 +58,17 @@ const CONTENT_TYPE = {
   ".ogg": "audio/ogg", ".wav": "audio/wav", ".mp3": "audio/mpeg", ".opus": "audio/opus"
 };
 
-function typeForExt(ext) {
-  ext = ext.toLowerCase();
+// Type from filename. PBR data maps (normal/rough/metal/etc.) ship as
+// .exr too, so a texture-map name keyword overrides the .exr=hdri
+// default — otherwise normal/rough EXRs get mis-typed as HDRIs.
+function typeForFile(name) {
+  const base = String(name).toLowerCase();
+  const m = base.match(/\.[^.]+$/);
+  const ext = m ? m[0] : "";
   if (ext === ".glb" || ext === ".gltf") return "mesh";
+  if (/(^|[_-])(diff|diffuse|albedo|color|col|basecolor|nor_gl|nor_dx|normalgl|normaldx|normal|nor|rough|roughness|metal|metalness|metallic|ao|disp|displacement|height|spec|specular|opacity|mask|alpha|arm|orm|bump|emissive|emission)([_-]|\.|[0-9]|$)/.test(base)) {
+    return ext === ".hdr" ? "hdri" : "texture";
+  }
   if (ext === ".hdr" || ext === ".exr") return "hdri";
   if (ext === ".png" || ext === ".jpg" || ext === ".jpeg" || ext === ".webp") return "texture";
   if (ext === ".ogg" || ext === ".wav" || ext === ".mp3" || ext === ".opus") return "audio";
