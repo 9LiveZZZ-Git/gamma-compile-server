@@ -20,7 +20,7 @@
 import express from "express";
 import {
   createReadStream, createWriteStream, statSync, existsSync,
-  mkdirSync, readFileSync, writeFileSync
+  mkdirSync, readFileSync, writeFileSync, copyFileSync, readdirSync
 } from "node:fs";
 import { join, dirname, extname, basename } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -31,6 +31,11 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const ASSETS_DIR = join(__dirname, "..", "assets");
 const MANIFEST_PATH = join(ASSETS_DIR, "manifest.json");
 const SEED_PATH = join(__dirname, "asset-seed.json");
+// Committed (NOT gitignored) bundle of demo assets shipped with the
+// repo, so a fresh clone has the assets the editor's demos reference
+// without the user re-downloading anything. Ingested into the local
+// cache + manifest on launch.
+const BUNDLED_DIR = join(__dirname, "..", "seed-assets");
 
 const TYPE_DIR = { mesh: "meshes", texture: "textures", hdri: "hdris", audio: "audio" };
 
@@ -154,7 +159,7 @@ function download(url, destPath, redirects = 0) {
 async function fetchAsset({ url, name, source, type }) {
   if (!hostAllowed(url)) throw new Error("source host not whitelisted: " + url);
   const fname = name || basename(new URL(url).pathname);
-  const t = type || typeForExt(extname(fname));
+  const t = type || typeForFile(fname);
   const rel = join(TYPE_DIR[t] || ".", fname).replace(/\\/g, "/");
   const dest = join(ASSETS_DIR, rel);
   const size = await download(url, dest);
@@ -198,9 +203,41 @@ async function runSeedFetch() {
     "/" + _fetchStatus.total + " ok)");
 }
 
+// Copy any files in the committed seed-assets/ dir into the local
+// cache + manifest (idempotent — skips ids already present). Lets the
+// repo ship the demo textures/HDRIs so other machines have them with
+// no manual import or download.
+function ingestBundledAssets() {
+  if (!existsSync(BUNDLED_DIR)) return;
+  let files = [];
+  try { files = readdirSync(BUNDLED_DIR); } catch (_) { return; }
+  let added = 0;
+  for (const fname of files) {
+    if (fname.startsWith(".")) continue;
+    const src = join(BUNDLED_DIR, fname);
+    let st; try { st = statSync(src); } catch (_) { continue; }
+    if (!st.isFile()) continue;
+    const id = slugify(fname);
+    if (manifestById(id)) continue;
+    const t = typeForFile(fname);
+    const rel = join(TYPE_DIR[t] || ".", fname).replace(/\\/g, "/");
+    const dest = join(ASSETS_DIR, rel);
+    try {
+      mkdirSync(dirname(dest), { recursive: true });
+      copyFileSync(src, dest);
+      addEntry({ id, type: t, name: basename(fname, extname(fname)), file: rel, size: st.size, source: "bundled", addedAt: Date.now() });
+      added++;
+    } catch (e) {
+      console.warn("[assets] bundle ingest failed for " + fname + ": " + (e && e.message));
+    }
+  }
+  if (added) console.log("[assets] ingested " + added + " bundled asset(s) from seed-assets/");
+}
+
 export function attachAssetRoutes(app, opts = {}) {
   ensureDirs();
   _manifest = loadManifest();
+  ingestBundledAssets();
 
   // GET /assets — the manifest (optionally filtered by ?type=mesh).
   app.get("/assets", (req, res) => {
@@ -276,7 +313,7 @@ export function attachAssetRoutes(app, opts = {}) {
       const name = req.params.name;
       const buf = req.body;
       if (!Buffer.isBuffer(buf) || !buf.length) return res.status(400).json({ error: "empty body" });
-      const t = typeForExt(extname(name));
+      const t = typeForFile(name);
       const rel = join(TYPE_DIR[t] || ".", name).replace(/\\/g, "/");
       const dest = join(ASSETS_DIR, rel);
       try {
