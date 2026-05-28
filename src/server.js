@@ -14,6 +14,7 @@ import { startOscBridge } from "./osc-bridge.js";
 import { probeEngine, spawnEngine, isPortInUse } from "./rt-engine-host.js";
 import { attachRtProxy } from "./rt-proxy.js";
 import { attachSdRoute } from "./sd-route.js";
+import { attachAssetRoutes } from "./asset-route.js";
 
 // Read package version once at startup so /health reports the actual
 // running version. Better than hardcoding a string that drifts on bumps.
@@ -88,6 +89,12 @@ export async function startServer({
   // unless scripts/install-sd.sh has been run (the route returns 503
   // with install instructions if Python venv or model is missing).
   attachSdRoute(app);
+
+  // Phase 8.B.15 / §8.F bootstrap -- asset hosting + streaming for the
+  // editor (environment GLBs, PBR textures, HDRIs). Auto-fetches the
+  // curated m3-org + SpectraStudios seed on first launch; user-dropped
+  // Poly Haven files arrive via PUT /assets/import.
+  attachAssetRoutes(app);
 
   // Sprint 7.5.6.a part 1 -- probe the rt-engine binary at server
   // start. The result is reported back via /health so the editor

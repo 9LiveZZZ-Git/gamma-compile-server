@@ -1,0 +1,18 @@
+[
+  { "source": "spectrastudios", "type": "mesh", "name": "Market_Day.glb",
+    "url": "https://raw.githubusercontent.com/SpectraStudios/SourceCityToolkit_glb/main/Market_Day.glb" },
+  { "source": "spectrastudios", "type": "mesh", "name": "Main_Intersection_v2.glb",
+    "url": "https://raw.githubusercontent.com/SpectraStudios/SourceCityToolkit_glb/main/Main_Intersection_v2.glb" },
+  { "source": "spectrastudios", "type": "mesh", "name": "Apartment_1_2.glb",
+    "url": "https://raw.githubusercontent.com/SpectraStudios/SourceCityToolkit_glb/main/Apartment_1_2.glb" },
+  { "source": "spectrastudios", "type": "mesh", "name": "Apartment_3.glb",
+    "url": "https://raw.githubusercontent.com/SpectraStudios/SourceCityToolkit_glb/main/Apartment_3.glb" },
+  { "source": "m3-org", "type": "mesh", "name": "anvil.glb",
+    "url": "https://raw.githubusercontent.com/m3-org/base-meshes/main/models/anvil/anvil.glb" },
+  { "source": "m3-org", "type": "mesh", "name": "axe.glb",
+    "url": "https://raw.githubusercontent.com/m3-org/base-meshes/main/models/axe/axe.glb" },
+  { "source": "m3-org", "type": "mesh", "name": "apple.glb",
+    "url": "https://raw.githubusercontent.com/m3-org/base-meshes/main/models/apple/apple.glb" },
+  { "source": "m3-org", "type": "mesh", "name": "acorn.glb",
+    "url": "https://raw.githubusercontent.com/m3-org/base-meshes/main/models/acorn/acorn.glb" }
+]
