@@ -24,6 +24,11 @@ const { values: opts } = parseArgs({
     oscInPort:   { type: "string",  default: "9000" },     // udp listen port
     oscOutHost:  { type: "string",  default: "127.0.0.1" },// default udp send target host
     oscOutPort:  { type: "string",  default: "9001" },     // default udp send target port
+    // Phase B sprint 3 -- optional Ollama daemon URL to probe + advertise
+    // via /health. Empty => default http://127.0.0.1:11434. Useful for
+    // multi-host setups where Ollama lives on a different machine from
+    // the compile daemon.
+    ollamaUrl:   { type: "string",  default: "" },
     help:        { type: "boolean", short: "h", default: false },
     version:     { type: "boolean", short: "v", default: false }
   },
@@ -73,6 +78,15 @@ Usage: gamma-compile-server [--port 8765] [--host 127.0.0.1]
                  message.
   --oscOutPort   Default destination port for outbound OSC (default
                  9001). Editor's OscOut node can override per message.
+  --ollamaUrl    Optional URL of a local Ollama daemon to probe + report
+                 via /health (default http://127.0.0.1:11434). The
+                 editor's AI panel + LLM nodes consume this snapshot as
+                 a secondary signal next to their own direct probe. Set
+                 this when Ollama runs on a different host from the
+                 compile daemon (e.g. headless GPU box on the LAN).
+                 Install Ollama from ollama.com/download — no manual
+                 setup needed here; the probe is silent when the daemon
+                 isn't installed.
   --help         Show this message.
   --version      Print version and exit.
 
@@ -161,7 +175,8 @@ await startServer({
   osc:         !opts.noOsc,
   oscInPort,
   oscOutHost:  opts.oscOutHost,
-  oscOutPort
+  oscOutPort,
+  ollamaUrl:   opts.ollamaUrl
 });
 
 function defaultCacheDir() {

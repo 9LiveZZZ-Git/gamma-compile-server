@@ -15,6 +15,7 @@ import { probeEngine, spawnEngine, isPortInUse } from "./rt-engine-host.js";
 import { attachRtProxy } from "./rt-proxy.js";
 import { attachSdRoute } from "./sd-route.js";
 import { attachAssetRoutes } from "./asset-route.js";
+import { startOllamaProbe, getOllamaSnapshot, stopOllamaProbe } from "./ollama-probe.js";
 
 // Read package version once at startup so /health reports the actual
 // running version. Better than hardcoding a string that drifts on bumps.
@@ -38,7 +39,12 @@ const DEFAULT_ALLOWED_ORIGINS = [
 export async function startServer({
   port, host, extraOrigins, toolchain, cacheDir,
   // OSC bridge options (all optional; bridge is on by default).
-  osc = true, oscInPort = 9000, oscOutHost = "127.0.0.1", oscOutPort = 9001
+  osc = true, oscInPort = 9000, oscOutHost = "127.0.0.1", oscOutPort = 9001,
+  // Phase B sprint 3 -- local Ollama daemon to advertise via /health.
+  // Empty / undefined -> default 127.0.0.1:11434. Set to a LAN address
+  // (e.g. http://192.168.1.42:11434) if Ollama runs on a different host
+  // from the compile daemon. The probe runs at startup + every 60s.
+  ollamaUrl = ""
 }) {
   const bindHost = host || "127.0.0.1";
   // Normalize extra origins (strip trailing slash, drop blanks).
@@ -128,6 +134,17 @@ export async function startServer({
     console.warn("[rt-engine] probe/spawn threw:", e && e.message);
   }
 
+  // Phase B sprint 3 -- start the Ollama daemon probe in the background.
+  // Returns once the first probe completes (success OR failure), so the
+  // first /health response after startup carries an accurate snapshot.
+  // The probe re-runs every 60 s; failures are silent after the first
+  // startup log line.
+  try {
+    await startOllamaProbe(ollamaUrl);
+  } catch (e) {
+    console.warn("[ollama] probe init threw:", e && e.message);
+  }
+
   // Clean shutdown -- send SIGTERM to the engine on Ctrl-C so we
   // don't leave a zombie process owning port 9100. The OSC bridge +
   // HTTP server close themselves cleanly via process exit; only the
@@ -137,6 +154,7 @@ export async function startServer({
     if (rtEngineHandle) {
       await rtEngineHandle.stop();
     }
+    stopOllamaProbe();
     process.exit(0);
   };
   process.once("SIGINT", () => shutdown("SIGINT"));
@@ -172,7 +190,22 @@ export async function startServer({
             spawned: rtEngineSpawned,
             pid: rtEngineHandle ? rtEngineHandle.child.pid : null }
         : { available: false, proxyReady: true, enginePort,
-            spawned: false, pid: null }
+            spawned: false, pid: null },
+      // Phase B sprint 3 -- local Ollama daemon snapshot. Polled every
+      // 60s in the background; the snapshot below is whatever the last
+      // probe returned. Editor reads this as a SECONDARY signal next to
+      // its own direct probe -- useful for LAN deployments where the
+      // editor can't probe directly due to mixed-content blocking, and
+      // for cold-start UX before the editor's own probe lands.
+      //
+      // Shape:
+      //   { present: boolean,
+      //     version: string | null,
+      //     models:  [{ name, size, modified_at }],  // empty if probe failed
+      //     baseUrl: string,
+      //     fetchedAt: number,                       // ms epoch
+      //     error: string | null }                   // only if probe failed
+      ollama: getOllamaSnapshot()
     });
   });
 
