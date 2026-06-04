@@ -1,6 +1,6 @@
 {
   "name": "@9livezzz/gamma-compile-server",
-  "version": "0.3.44",
+  "version": "0.3.45",
   "description": "Local Emscripten compile daemon + OSC bridge + Stable Diffusion sprite-gen worker for the Gamma Node Editor. Runs on localhost:8765 by default and listens for OSC on udp://localhost:9000; --host/--allowOrigin let it serve a LAN setup (e.g. iPad → Mac).",
   "type": "module",
   "main": "src/server.js",
@@ -9,7 +9,9 @@
   },
   "scripts": {
     "start": "node bin/gamma-compile-server.js",
-    "test": "node tests/smoke.js"
+    "test": "node tests/smoke.js",
+    "postinstall": "node scripts/setup-ollama.mjs",
+    "setup-ollama": "node scripts/setup-ollama.mjs"
   },
   "engines": {
     "node": ">=20.0.0"
