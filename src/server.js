@@ -15,6 +15,7 @@ import { probeEngine, spawnEngine, isPortInUse } from "./rt-engine-host.js";
 import { attachRtProxy } from "./rt-proxy.js";
 import { attachSdRoute } from "./sd-route.js";
 import { attachAssetRoutes } from "./asset-route.js";
+import { attachVaultRoutes } from "./vault-route.js";
 import { startOllamaProbe, getOllamaSnapshot, stopOllamaProbe } from "./ollama-probe.js";
 
 // Read package version once at startup so /health reports the actual
@@ -101,6 +102,12 @@ export async function startServer({
   // curated m3-org + SpectraStudios seed on first launch; user-dropped
   // Poly Haven files arrive via PUT /assets/import.
   attachAssetRoutes(app);
+
+  // Gamma-Node sprint tektite-10z -- Tektite vault hosting for files
+  // larger than the browser's IDB quota (videos, big PDFs, training
+  // corpora). PUT /vault/file/<path> raw upload + GET range stream +
+  // DELETE.  Client docs at docs/ROADMAP.md §13.6 in Gamma-Node.
+  attachVaultRoutes(app);
 
   // Sprint 7.5.6.a part 1 -- probe the rt-engine binary at server
   // start. The result is reported back via /health so the editor
